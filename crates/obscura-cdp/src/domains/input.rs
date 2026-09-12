@@ -148,7 +148,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -233,44 +233,8 @@ pub async fn handle(
                         shift_key = shift_key,
                     );
                     page.evaluate(&code);
-                    let moved = page
-                        .process_pending_navigation()
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    // Fork: a single page app answers a click by routing itself,
-                    // with no document fetch. The client still has to be told the
-                    // frame moved, or the click looks like it did nothing.
-                    if moved {
-                        let url = page.url_string();
-                        let frame_id = page.frame_id.clone();
-                        Some((page.id.clone(), frame_id, url))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx
-                        .current_loader_ids
-                        .get(&page_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
-                            "frame": crate::domains::page::frame_value(
-                                &frame_id,
-                                None,
-                                &loader_id,
-                                &url,
-                                "text/html",
-                            ),
-                            "type": "Navigation",
-                        }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
-                    });
                 }
+                super::runtime::emit_post_eval_nav(ctx, session_id).await?;
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -419,6 +383,59 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::js_str;
+    use crate::dispatch::CdpContext;
+    use serde_json::json;
+
+    async fn click_fixture(same_document: bool) -> (CdpContext, String, String, i64) {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        let session = Some(session_id.clone());
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+        crate::domains::page::handle("navigate", &json!({
+            "url": "data:text/html,<html><body><a id=go href='data:text/html,%3Ch1%3EDestination%3C/h1%3E'>Next</a></body></html>"
+        }), &mut ctx, &session).await.unwrap();
+        crate::domains::runtime::handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
+        let observer = format!("{page_id}-observer");
+        ctx.sessions.insert(observer.clone(), page_id.clone());
+        crate::domains::runtime::handle("enable", &json!({}), &mut ctx, &Some(observer)).await.unwrap();
+        let old_context = ctx.default_context_id(&page_id).unwrap();
+        let page = ctx.get_session_page_mut(&session).unwrap();
+        page.evaluate("document.elementFromPoint = () => document.getElementById('go')");
+        if same_document {
+            page.evaluate("document.getElementById('go').onclick = e => {e.preventDefault(); history.pushState({}, '', '#next');}");
+        }
+        ctx.pending_events.clear();
+        for kind in ["mousePressed", "mouseReleased"] {
+            super::handle("dispatchMouseEvent", &json!({"type": kind, "button": "left", "x": 10, "y": 10, "clickCount": 1}), &mut ctx, &session).await.unwrap();
+        }
+        (ctx, page_id, session_id, old_context)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_navigation_replaces_contexts_and_notifies_runtime_observers() {
+        let (mut ctx, page_id, session_id, old_context) = click_fixture(false).await;
+        assert_ne!(ctx.default_context_id(&page_id).unwrap(), old_context);
+        for session in [session_id.clone(), format!("{page_id}-observer")] {
+            assert!(ctx.pending_events.iter().any(|event| event.method == "Runtime.executionContextsCleared" && event.session_id.as_ref() == Some(&session)));
+            assert!(ctx.pending_events.iter().any(|event| event.method == "Runtime.executionContextCreated" && event.session_id.as_ref() == Some(&session)));
+        }
+        assert!(ctx.pending_events.iter().any(|event| event.method == "Page.loadEventFired"));
+        let result = crate::domains::runtime::handle("evaluate", &json!({
+            "expression": "document.querySelector('h1').textContent", "returnByValue": true,
+            "contextId": ctx.default_context_id(&page_id).unwrap()
+        }), &mut ctx, &Some(session_id)).await.unwrap();
+        assert_eq!(result["result"]["value"], json!("Destination"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_history_navigation_preserves_contexts() {
+        let (ctx, page_id, _, old_context) = click_fixture(true).await;
+        assert_eq!(ctx.default_context_id(&page_id).unwrap(), old_context);
+        assert!(ctx.pending_events.iter().any(|event| event.method == "Page.navigatedWithinDocument"));
+        assert!(!ctx.pending_events.iter().any(|event| event.method == "Runtime.executionContextsCleared"));
+        assert!(!ctx.pending_events.iter().any(|event| event.method == "Page.frameNavigated"));
+    }
 
     // SEC-501 / #819 — key/code are embedded via js_str; it must escape control
     // characters (newline/CR/tab/NUL/U+2028-29), not just backslash and quote,
