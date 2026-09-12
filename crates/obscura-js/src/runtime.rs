@@ -3680,6 +3680,46 @@ mod tests {
         rt
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn live_form_values_paint_without_mutating_content_attributes() {
+        let mut rt = setup_runtime("<!doctype html><html><body><input id=field value=initial><input id=box type=checkbox></body></html>");
+        rt.set_viewport(320.0, 120.0);
+        let before = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        rt.evaluate("document.getElementById('field').value = 'changed'").unwrap();
+        let changed_value = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(before, changed_value, "live text value must affect pixels");
+        rt.evaluate("document.getElementById('box').checked = true").unwrap();
+        let after = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(changed_value, after, "checked state must affect pixels");
+        assert_eq!(rt.evaluate("[document.getElementById('field').value, document.getElementById('field').getAttribute('value'), document.getElementById('box').getAttribute('checked'), document.querySelectorAll(':checked').length]").unwrap(), serde_json::json!(["changed", "initial", null, 1]));
+        rt.evaluate("(document.getElementById('field').value = 'initial', document.getElementById('box').checked = false)").unwrap();
+        assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+        rt.evaluate("document.getElementById('field').value = ''").unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('field').value").unwrap(), serde_json::json!(""));
+        assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap(), "empty current value must override a nonempty default");
+    }
+
+    #[test]
+    fn cloned_controls_keep_current_value_and_checked_state() {
+        let mut rt = setup_runtime("<html><body><div id=group><input id=field value=default><input id=box type=checkbox></div></body></html>");
+        let result = rt.evaluate("(() => {const field=document.getElementById('field'), box=document.getElementById('box');field.value='current';box.checked=true;box.indeterminate=true;const clone=document.getElementById('group').cloneNode(true);return [clone.children[0].value,clone.children[0].getAttribute('value'),clone.children[1].checked,clone.children[1].indeterminate];})()").unwrap();
+        assert_eq!(result, serde_json::json!(["current", "default", true, false]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn resetting_an_empty_default_input_clears_live_paint_state() {
+        let mut rt = setup_runtime("<html><body><form id=form><input id=field></form></body></html>");
+        rt.set_viewport(320.0, 120.0);
+        let before = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        rt.evaluate("document.getElementById('field').value = 'typed'").unwrap();
+        assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+        rt.evaluate("document.getElementById('form').reset()").unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('field').value").unwrap(), serde_json::json!(""));
+        assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+    }
+
     // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
     // that merely has a .text() method, e.g. Response) with a TypeError, as
     // Chrome does; a real Blob is still accepted.
