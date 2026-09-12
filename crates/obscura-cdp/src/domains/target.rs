@@ -148,7 +148,7 @@ pub async fn handle(
             // Playwright calls this on connect to obtain a session for the
             // implicit "browser" target. Returning Unknown method aborts
             // the connect handshake before any user code runs.
-            let session_id = "browser-session".to_string();
+            let session_id = format!("browser-{}", uuid::Uuid::new_v4());
             ctx.sessions
                 .insert(session_id.clone(), "browser".to_string());
 
@@ -389,9 +389,9 @@ mod tests {
             .await
             .expect("attachToBrowserTarget should succeed");
 
-        assert_eq!(result["sessionId"], "browser-session");
+        let session_id = result["sessionId"].as_str().unwrap();
         assert_eq!(
-            ctx.sessions.get("browser-session").map(String::as_str),
+            ctx.sessions.get(session_id).map(String::as_str),
             Some("browser")
         );
 
@@ -403,8 +403,12 @@ mod tests {
             .iter()
             .find(|e| e.method == "Target.attachedToTarget")
             .expect("attachedToTarget event must be emitted");
-        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["sessionId"], session_id);
         assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+        let second = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None).await.unwrap();
+        assert_ne!(result["sessionId"], second["sessionId"]);
+        handle("detachFromTarget", &json!({"sessionId": result["sessionId"]}), &mut ctx, &None).await.unwrap();
+        assert!(ctx.sessions.contains_key(second["sessionId"].as_str().unwrap()));
     }
 
     #[tokio::test]
