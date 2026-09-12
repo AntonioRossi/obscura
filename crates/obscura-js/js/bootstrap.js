@@ -61,6 +61,8 @@
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'Navigator', 'PluginArray', 'Plugin', 'MimeTypeArray', 'MimeType',
+    'Location', 'Performance', 'DOMRect', 'DOMRectReadOnly',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -4568,9 +4570,7 @@ class Element extends Node {
   _renderClientMetrics() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
-      if (!raw) return { width: 0, height: 0 };
-      const geometry = JSON.parse(raw);
+      const geometry = this._renderBoxGeometry();
       if (geometry
           && Number.isFinite(geometry.clientWidth)
           && Number.isFinite(geometry.clientHeight)) {
@@ -4593,7 +4593,10 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const child = _iframeLayoutForNode(this, false);
+      const raw = child === undefined
+        ? Deno.core.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId)
+        : child;
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -6534,6 +6537,10 @@ globalThis.location = {
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
 };
+function Location() { throw new TypeError('Illegal constructor'); }
+Object.defineProperty(Location.prototype, Symbol.toStringTag, {value: 'Location', configurable: true});
+Object.setPrototypeOf(globalThis.location, Location.prototype);
+globalThis.Location = _markNative(Location);
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
@@ -6668,16 +6675,20 @@ for (let i = 0; i < 50; i++) {
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
 // navigatorPrototype checks don't throw a ReferenceError.
-function Navigator() {}
+function Navigator() { throw new TypeError('Illegal constructor'); }
+Object.defineProperty(Navigator.prototype, Symbol.toStringTag, {value: 'Navigator', configurable: true});
 _markNative(Navigator);
+globalThis.Navigator = Navigator;
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
-function PluginArray(items) {
+const _pluginConstructionKey = Symbol();
+function PluginArray(items, key) {
+  if (key !== _pluginConstructionKey) throw new TypeError('Illegal constructor');
   for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
   this.length = items.length;
 }
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
+PluginArray.prototype = Object.create(Object.prototype);
+Object.defineProperty(PluginArray.prototype, 'constructor', {value: PluginArray, writable: true, configurable: true});
 PluginArray.prototype.item = function(i) { return this[i] || null; };
 PluginArray.prototype.namedItem = function(name) {
   for (var _pi = 0; _pi < this.length; _pi++) {
@@ -6696,9 +6707,10 @@ _markNative(PluginArray.prototype.refresh);
 // Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
 // global constructors; their absence threw "ReferenceError: Plugin is not
 // defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
-function Plugin(name, filename, description, mimeTypes) {
+// declarations are local to the bootstrap closure, so explicitly expose the
+// interfaces after defining them. Only the engine may create their instances.
+function Plugin(name, filename, description, mimeTypes, key) {
+  if (key !== _pluginConstructionKey) throw new TypeError('Illegal constructor');
   this.name = name;
   this.filename = filename;
   this.description = description;
@@ -6717,7 +6729,8 @@ _markNative(Plugin);
 _markNative(Plugin.prototype.item);
 _markNative(Plugin.prototype.namedItem);
 
-function MimeType(type, description, suffixes, plugin) {
+function MimeType(type, description, suffixes, plugin, key) {
+  if (key !== _pluginConstructionKey) throw new TypeError('Illegal constructor');
   this.type = type;
   this.description = description;
   this.suffixes = suffixes;
@@ -6726,7 +6739,8 @@ function MimeType(type, description, suffixes, plugin) {
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
-function MimeTypeArray(items) {
+function MimeTypeArray(items, key) {
+  if (key !== _pluginConstructionKey) throw new TypeError('Illegal constructor');
   for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
   this.length = items.length;
 }
@@ -6740,6 +6754,10 @@ Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'Mime
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
+for (const C of [PluginArray, Plugin, MimeTypeArray, MimeType]) {
+  Object.defineProperty(C, 'length', {value: 0, configurable: true});
+  globalThis[C.name] = C;
+}
 
 class NetworkInformation {
   constructor() { this._listeners = Object.create(null); }
@@ -6900,11 +6918,11 @@ globalThis.navigator = {
   },
 };
 
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
+// Put browser identity props on Navigator.prototype
 // so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
 // Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
+  var _navProto = Navigator.prototype;
 
   function defGetter(key, fn) {
     _markNative(fn);
@@ -6932,16 +6950,16 @@ globalThis.navigator = {
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
+    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", [], _pluginConstructionKey),
+    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", [], _pluginConstructionKey),
+    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", [], _pluginConstructionKey),
+    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", [], _pluginConstructionKey),
+    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", [], _pluginConstructionKey),
+  ], _pluginConstructionKey);
   var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-  ]);
+    new MimeType("application/pdf", "Portable Document Format", "pdf", null, _pluginConstructionKey),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", null, _pluginConstructionKey),
+  ], _pluginConstructionKey);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7876,7 +7894,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8394,7 +8412,10 @@ globalThis.getComputedStyle = (el) => {
     snapshot.rendered = null;
     if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+        const child = _iframeLayoutForNode(el, true);
+        const raw = child === undefined
+          ? Deno.core.ops.op_computed_style(String(el._nid | 0), _realmFrameId)
+          : child;
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -11751,6 +11772,11 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
 globalThis.EventTarget = Node;
+function Performance() { throw new TypeError('Illegal constructor'); }
+Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, {value: 'Performance', configurable: true});
+Object.setPrototypeOf(globalThis.performance, Performance.prototype);
+globalThis.Performance = _markNative(Performance);
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -12242,6 +12268,27 @@ _markNative(globalThis.Selection);
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
+const _iframeDocumentsByRoot = new WeakMap();
+let _hasIframeDocuments = false;
+
+// Synchronous about:blank/srcdoc frames retain their own detached HTML tree.
+// Only registered documents get layout: an ordinary detached element still
+// has no associated CSS box. Nested frames resolve the embedding viewport in
+// their parent document before measuring the child.
+function _iframeLayoutForNode(el, style) {
+  if (!_hasIframeDocuments) return undefined;
+  const root = el.getRootNode({ composed: true });
+  const doc = _iframeDocumentsByRoot.get(root);
+  if (!doc) return undefined;
+  const host = doc._iframeEl?._renderBoxGeometry();
+  if (!host || typeof Deno.core.ops.op_subdocument_layout !== 'function') return '';
+  return Deno.core.ops.op_subdocument_layout(JSON.stringify({
+    root: root._nid, host: doc._iframeEl._nid, node: el._nid, epoch: _domMutationEpoch,
+    width: host.clientWidth, height: host.clientHeight,
+    url: doc._url.startsWith('about:') ? document.baseURI : doc._url, style,
+  }), _realmFrameId);
+}
+
 class _IframeDocument {
   constructor(html, url, iframeEl) {
     this._url = url;
@@ -12255,6 +12302,8 @@ class _IframeDocument {
     this.hidden = false;
 
     this._root = document.createElement('html');
+    _iframeDocumentsByRoot.set(this._root, this);
+    _hasIframeDocuments = true;
     this._head = document.createElement('head');
     this._body = document.createElement('body');
     this._root.appendChild(this._head);
@@ -12355,6 +12404,11 @@ class _IframeDocument {
 }
 
 const _iframeRealmGlobalCache = new WeakMap();
+const _iframeBrowserInterfaces = {
+  Navigator: null, PluginArray: null, Plugin: null, MimeTypeArray: null,
+  MimeType: null, Location: null, Performance: 'EventTarget',
+  DOMRectReadOnly: null, DOMRect: 'DOMRectReadOnly',
+};
 let _iframeRealmGlobalNames = [];
 let _iframeRealmGlobalNameSet = new Set();
 
@@ -12413,7 +12467,42 @@ function _iframeRealmGlobal(target, name) {
     value = Object.create(source);
   }
   cache.set(name, value);
+  // These browser interfaces have instances on the child window. Inheriting
+  // their parent-realm prototype would make instanceof accept the wrong realm.
+  if (Object.hasOwn(_iframeBrowserInterfaces, name)) {
+    const parent = _iframeBrowserInterfaces[name];
+    const proto = Object.create(parent
+      ? _iframeRealmGlobal(target, parent).prototype : Object.prototype);
+    Object.defineProperties(proto, Object.getOwnPropertyDescriptors(source.prototype));
+    Object.defineProperty(proto, 'constructor', {value, writable: true, configurable: true});
+    value.prototype = proto;
+  }
   return value;
+}
+
+function _iframeBrowserInstance(target, source, name, seen = new Map()) {
+  if (seen.has(source)) return seen.get(source);
+  const proto = _iframeRealmGlobal(target, name).prototype;
+  const instance = Object.create(proto);
+  seen.set(source, instance);
+  const descriptors = Object.getOwnPropertyDescriptors(source);
+  for (const descriptor of Object.values(descriptors)) {
+    const value = descriptor.value;
+    if (!value || typeof value !== 'object') continue;
+    const type = ['PluginArray','MimeTypeArray','Plugin','MimeType']
+      .find(n => value instanceof globalThis[n]);
+    if (type) descriptor.value = _iframeBrowserInstance(target, value, type, seen);
+  }
+  Object.defineProperties(instance, descriptors);
+  if (name === 'Navigator') {
+    for (const [key, type] of [['plugins','PluginArray'],['mimeTypes','MimeTypeArray']]) {
+      const value = _iframeBrowserInstance(target, source[key], type, seen);
+      Object.defineProperty(proto, key, {
+        get: _markNative(function() { return value; }), enumerable: true, configurable: true,
+      });
+    }
+  }
+  return instance;
 }
 
 const _iframeWindowProxyHandler = {
@@ -12676,7 +12765,7 @@ class _IframeWindow {
     this.length = 0;
     this.name = '';
     this.closed = false;
-    this.navigator = globalThis.navigator;
+    this.navigator = _iframeBrowserInstance(this, globalThis.navigator, 'Navigator');
     this.screen = globalThis.screen;
     this.innerWidth = 300;
     this.innerHeight = 150;
@@ -12685,7 +12774,7 @@ class _IframeWindow {
     this.devicePixelRatio = globalThis.devicePixelRatio;
     this.localStorage = globalThis.localStorage;
     this.sessionStorage = globalThis.sessionStorage;
-    this.performance = globalThis.performance;
+    this.performance = _iframeBrowserInstance(this, globalThis.performance, 'Performance');
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
     this.chrome = globalThis.chrome;
@@ -12702,6 +12791,7 @@ class _IframeWindow {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
 
+    Object.setPrototypeOf(this.location, _iframeRealmGlobal(this, 'Location').prototype);
     const proxy = new Proxy(this, _iframeWindowProxyHandler);
     this.self = proxy;
     this.window = proxy;
@@ -14288,12 +14378,55 @@ if (!globalThis.crypto.subtle) {
   globalThis.crypto.subtle = subtle;
 }
 
-if (typeof DOMRect === 'undefined') {
-  globalThis.DOMRect = class DOMRect {
-    constructor(x=0,y=0,w=0,h=0) { this.x=x;this.y=y;this.width=w;this.height=h;this.top=y;this.right=x+w;this.bottom=y+h;this.left=x; }
-    toJSON() { return {x:this.x,y:this.y,width:this.width,height:this.height,top:this.top,right:this.right,bottom:this.bottom,left:this.left}; }
-    static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
-  };
+const _rectSlots = new WeakMap();
+function _rectData(rect) {
+  const data = _rectSlots.get(rect);
+  if (!data) throw new TypeError('Illegal invocation');
+  return data;
+}
+function _rectDictionary(rect) {
+  if (rect == null) return {};
+  if (typeof rect !== 'object' && typeof rect !== 'function') throw new TypeError('Expected a rectangle dictionary');
+  return rect;
+}
+class DOMRectReadOnly {
+  constructor(x=0, y=0, width=0, height=0) {
+    _rectSlots.set(this, {x: +x, y: +y, width: +width, height: +height});
+  }
+  get x() { return _rectData(this).x; }
+  get y() { return _rectData(this).y; }
+  get width() { return _rectData(this).width; }
+  get height() { return _rectData(this).height; }
+  get top() { const r = _rectData(this); return Math.min(r.y, r.y + r.height); }
+  get right() { const r = _rectData(this); return Math.max(r.x, r.x + r.width); }
+  get bottom() { const r = _rectData(this); return Math.max(r.y, r.y + r.height); }
+  get left() { const r = _rectData(this); return Math.min(r.x, r.x + r.width); }
+  toJSON() { return {x:this.x, y:this.y, width:this.width, height:this.height, top:this.top, right:this.right, bottom:this.bottom, left:this.left}; }
+  static fromRect(value={}) { const r = _rectDictionary(value); return new DOMRectReadOnly(r.x, r.y, r.width, r.height); }
+}
+class DOMRect extends DOMRectReadOnly {
+  get x() { return _rectData(this).x; }
+  set x(value) { _rectData(this).x = +value; }
+  get y() { return _rectData(this).y; }
+  set y(value) { _rectData(this).y = +value; }
+  get width() { return _rectData(this).width; }
+  set width(value) { _rectData(this).width = +value; }
+  get height() { return _rectData(this).height; }
+  set height(value) { _rectData(this).height = +value; }
+  static fromRect(value={}) { const r = _rectDictionary(value); return new DOMRect(r.x, r.y, r.width, r.height); }
+}
+for (const C of [DOMRectReadOnly, DOMRect]) {
+  Object.defineProperty(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
+  for (const key of Object.getOwnPropertyNames(C.prototype)) {
+    if (key === 'constructor') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(C.prototype, key);
+    Object.defineProperty(C.prototype, key, {...descriptor, enumerable: true});
+    for (const fn of [descriptor.get, descriptor.set, descriptor.value]) {
+      if (typeof fn === 'function') _markNative(fn);
+    }
+  }
+  _markNative(C.fromRect);
+  globalThis[C.name] = _markNative(C);
 }
 
 if (typeof DOMRectList === 'undefined') {

@@ -107,7 +107,28 @@ pub fn is_fatal_event_loop_error(error: &str) -> bool {
 }
 
 #[cfg(feature = "render")]
-fn with_sync_render_loading_disabled<R>(
+fn render_document_roots(state: &ObscuraState) -> Vec<(NodeId, (f32, f32), Option<String>)> {
+    let Some(dom) = state.dom.as_ref() else { return Vec::new(); };
+    let mut roots = vec![(dom.document(), state.viewport, document_base_url(state))];
+    for (&root, layout) in &state.subdocument_layouts {
+        let mut host = layout.host;
+        // Nested synchronous frames belong to another detached document.
+        // Follow at most the bounded number of retained frame layouts.
+        for _ in 0..=state.subdocument_layouts.len() {
+            if dom.is_connected(host) {
+                roots.push((root, layout.viewport, Some(layout.base_url.clone())));
+                break;
+            }
+            let host_root = dom.ancestors(host).last().copied().unwrap_or(host);
+            let Some(parent) = state.subdocument_layouts.get(&host_root) else { break; };
+            host = parent.host;
+        }
+    }
+    roots
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
     capture: impl FnOnce(&mut ObscuraState) -> R,
 ) -> R {
@@ -1056,6 +1077,7 @@ impl ObscuraJsRuntime {
             gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
             gs.render_resources = obscura_render::RenderResourceCache::default();
+            gs.subdocument_layouts.clear();
             gs.render_image_in_flight.clear();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
@@ -1672,6 +1694,33 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// CSS sources from the main document and measured synchronous frames.
+    /// The browser consumes these through its existing native resource warmup.
+    #[cfg(feature = "render")]
+    pub fn render_css_sources(&self) -> Vec<(String, String)> {
+        let state = self.state.borrow();
+        let Some(dom) = state.dom.as_ref() else { return Vec::new(); };
+        let mut sources = Vec::new();
+        for (root, _, base) in render_document_roots(&state) {
+            let base = base.unwrap_or_else(|| state.url.clone());
+            for id in dom.descendants(root) {
+                let Some(node) = dom.get_node(id) else { continue; };
+                if node.as_element().is_some_and(|element| element.local.as_ref() == "style") {
+                    sources.push((dom.text_content(id), base.clone()));
+                }
+                if let Some(style) = node.get_attribute("style") {
+                    sources.push((style.to_string(), base.clone()));
+                }
+                if node.as_element().is_some_and(|element| element.local.as_ref() == "use") {
+                    if let Some(href) = node.get_attribute("href").or_else(|| node.get_attribute("xlink:href")) {
+                        sources.push((format!("url({href})"), base.clone()));
+                    }
+                }
+            }
+        }
+        sources
+    }
+
     /// Return the exact responsive candidates selected for live `<img>`
     /// elements and `<video poster>` resources without loading them. The
     /// browser layer can then fetch them concurrently through the page-owned
@@ -1679,12 +1728,12 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
         let state = self.state.borrow();
-        let base_url = document_base_url(&state);
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
         let mut urls = Vec::new();
-        for id in dom.descendants(dom.document()) {
+        for (root, viewport, base_url) in render_document_roots(&state) {
+          for id in dom.descendants(root) {
             let Some(node) = dom.get_node(id) else {
                 continue;
             };
@@ -1694,7 +1743,7 @@ impl ObscuraJsRuntime {
             let candidate = match element.local.as_ref() {
                 "img" => state
                     .render_resources
-                    .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
+                    .cached_image_element_metadata(dom, id, viewport, base_url.as_deref())
                     .map(|(url, _, known, _)| {
                         let profile = match node
                             .get_attribute("crossorigin")
@@ -1721,6 +1770,7 @@ impl ObscuraJsRuntime {
             if !known && !url.starts_with("data:") {
                 urls.push((url, profile));
             }
+          }
         }
         urls.sort();
         urls.dedup();
@@ -3271,6 +3321,7 @@ impl ObscuraJsRuntime {
             state.prepared_render = None;
             state.pending_style_mutations.clear();
             state.render_resources = obscura_render::RenderResourceCache::default();
+            state.subdocument_layouts.clear();
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
@@ -18766,5 +18817,35 @@ mod tests {
             serde_json::json!("true,true,1,true,1,true,0,0,true"),
             "label association must follow the HTML labelable-element rules"
         );
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod subdocument_resource_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[test]
+    fn iframe_geometry_never_opens_the_synchronous_compatibility_transport() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url("https://example.com/");
+        rt.run_page_init();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        rt.state.borrow_mut().render_resources = obscura_render::RenderResourceCache::with_loader(move |_: &str| {
+            count.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let result = rt.evaluate(r#"(() => {
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            const d = f.contentDocument;
+            d.body.innerHTML = '<style>@font-face{font-family:Remote;src:url(https://example.com/cold.woff2)}div{width:100px;height:20px;font-family:Remote}</style><div>cold font</div>';
+            return d.querySelector('div').getClientRects()[0].width;
+        })()"#).unwrap();
+        assert_eq!(result.as_f64(), Some(100.0));
+        assert_eq!(calls.load(Ordering::SeqCst), 0,
+            "iframe geometry must wait for page-native resource preparation");
+        assert!(rt.render_css_sources().iter().any(|(css, _)| css.contains("cold.woff2")));
     }
 }
