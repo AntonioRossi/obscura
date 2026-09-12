@@ -2579,37 +2579,43 @@ async fn op_fetch_url(
                     && kl != "content-type"
             }));
 
+    #[cfg(feature = "stealth")]
+    let stealth_client = {
+        let st = state.borrow();
+        let gs = st.borrow::<SharedState>().clone();
+        let client = gs.borrow().stealth_client.clone();
+        client
+    };
+
     if needs_preflight {
-        let preflight = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str())
-            .header(
-                "Access-Control-Request-Headers",
-                custom_headers
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
-
-        let allowed_origin = preflight
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let allow_credentials = preflight
-            .headers()
-            .get("access-control-allow-credentials")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let headers = std::collections::HashMap::from([
+            ("Origin".to_string(), page_origin.clone()),
+            ("Access-Control-Request-Method".to_string(), method.clone()),
+            ("Access-Control-Request-Headers".to_string(), custom_headers.keys().cloned().collect::<Vec<_>>().join(", ")),
+        ]);
+        let ordinary_preflight = async {
+            let mut request = client.request(reqwest::Method::OPTIONS, &url).timeout(fetch_timeout());
+            for (name, value) in &headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let response = request.send().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(response.headers().iter().map(|(k, v)|
+                (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect::<std::collections::HashMap<_, _>>())
+        };
+        #[cfg(feature = "stealth")]
+        let preflight = if let Some(stealth) = &stealth_client {
+            let parsed = url::Url::parse(&url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+            // Preflights never send or store website cookies.
+            stealth.send_single("OPTIONS", &parsed, &headers, &[], false, false).await
+                .map(|response| response.headers).map_err(|e| e.to_string())
+        } else {
+            ordinary_preflight.await
+        };
+        #[cfg(not(feature = "stealth"))]
+        let preflight = ordinary_preflight.await;
+        let preflight = preflight.map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+        let allowed_origin = preflight.get("access-control-allow-origin").map(String::as_str).unwrap_or("");
+        let allow_credentials = preflight.get("access-control-allow-credentials").map(String::as_str).unwrap_or("");
         if !cors_response_allows(credentials, &page_origin, allowed_origin, allow_credentials) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
@@ -2623,13 +2629,7 @@ async fn op_fetch_url(
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
-        if let Some(stealth) = stealth {
+        if let Some(stealth) = stealth_client {
             return stealth_fetch_all(
                 stealth,
                 url.clone(),
