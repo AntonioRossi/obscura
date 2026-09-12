@@ -4715,25 +4715,77 @@ fn paint_laid_dom_scrolled(
             }
         }
 
+        let input_type = node.get_attribute("type").unwrap_or("text").to_ascii_lowercase();
+        let checkable = name.local.as_ref() == "input" && matches!(input_type.as_str(), "checkbox" | "radio");
+        if checkable && rect.width > 0.0 && rect.height > 0.0 {
+            let control = tree.form_control_state(nid).unwrap_or_default();
+            let checked = control.checked.unwrap_or_else(|| node.get_attribute("checked").is_some());
+            let indeterminate = input_type == "checkbox" && control.indeterminate;
+            let disabled = node.get_attribute("disabled").is_some();
+            let size = rect.width.min(rect.height);
+            let x = rect.x + (rect.width - size) / 2.0;
+            let y = rect.y + (rect.height - size) / 2.0;
+            let shape = if input_type == "radio" {
+                PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, (size - 1.0).max(0.0) / 2.0)
+            } else {
+                tiny_skia::Rect::from_xywh(x + 0.5, y + 0.5, (size - 1.0).max(0.0), (size - 1.0).max(0.0))
+                    .map(PathBuilder::from_rect)
+            };
+            if let Some(shape) = shape {
+                let mut control_paint = Paint::default();
+                let selected = checked || indeterminate;
+                let color = if disabled { [160, 160, 160, 255] } else if selected { [0, 117, 255, 255] } else { [118, 118, 118, 255] };
+                control_paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+                control_paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
+                if input_type == "checkbox" && selected {
+                    pixmap.fill_path(&shape, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
+                } else {
+                    pixmap.stroke_path(&shape, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
+                }
+                if selected {
+                    if input_type == "radio" {
+                        if let Some(dot) = PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, size * 0.25) {
+                            pixmap.fill_path(&dot, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
+                        }
+                    } else {
+                        let mut mark = PathBuilder::new();
+                        mark.move_to(x + size * 0.2, y + size * 0.5);
+                        if indeterminate {
+                            mark.line_to(x + size * 0.8, y + size * 0.5);
+                        } else {
+                            mark.line_to(x + size * 0.43, y + size * 0.73);
+                            mark.line_to(x + size * 0.82, y + size * 0.25);
+                        }
+                        if let Some(mark) = mark.finish() {
+                            control_paint.set_color(Color::WHITE);
+                            let stroke = tiny_skia::Stroke { width: (size * 0.14).max(1.0), ..Default::default() };
+                            pixmap.stroke_path(&mark, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
+                        }
+                    }
+                }
+            }
+        }
+
         // An empty text `<input>`/`<textarea>` shows its `placeholder`
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node
-                .get_attribute("value")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
+        if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
+            let live_value = tree.form_control_state(nid).and_then(|control| control.value);
+            let value = live_value.as_deref().or_else(|| node.get_attribute("value"));
+            let has_value = value.is_some_and(|v| !v.is_empty())
                 || (name.local.as_ref() == "textarea"
                     && !tree.text_content(nid).is_empty());
             // A text `<input>`'s value is not a DOM text node either, so it
-            // needs painting from the attribute the same way. Without this the
+            // needs painting from its live state, falling back to the attribute.
+            // Without this the
             // control renders empty however it was filled in — from markup,
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
             // `<textarea>` is unaffected: its value *is* a text node.
             if has_value && name.local.as_ref() == "input" {
-                if let Some(value) = node.get_attribute("value") {
+                if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
                         let text_x = rect.x + style.padding.left + style.border.left;

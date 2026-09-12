@@ -697,13 +697,7 @@ function _getFp() {
 }
 function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
-globalThis._formValues = globalThis._formValues || {};
-globalThis._formChecked = globalThis._formChecked || {};
-globalThis._formIndeterminate = globalThis._formIndeterminate || {};
 const _eventRegistry = globalThis._eventRegistry;
-const _formValues = globalThis._formValues;
-const _formChecked = globalThis._formChecked;
-const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -3972,7 +3966,8 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    const currentValue = _domParse("get_form_value", this._nid);
+    if (currentValue !== null) return currentValue;
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4023,7 +4018,7 @@ class Element extends Node {
       }
       return;
     }
-    _formValues[this._nid] = String(v);
+    _dom("set_form_value", this._nid, String(v));
     if (tag === 'textarea') {
       this.textContent = String(v);
     }
@@ -4101,17 +4096,17 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
+    const currentChecked = _domParse("get_form_checked", this._nid);
+    if (currentChecked !== null) return currentChecked;
     return this.hasAttribute("checked");
   }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  set checked(v) { _dom("set_form_checked", this._nid, String(!!v)); }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
-  // el` to be true on a freshly created element. It is node-keyed like
-  // `checked` because element wrappers are rebuilt on each lookup, so a
-  // per-instance field would not survive getElementById returning a new one.
-  get indeterminate() { return _formIndeterminate[this._nid] === true; }
-  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
+  // el` to be true on a freshly created element. Native node-keyed state
+  // keeps IDL access and rendering consistent without changing attributes.
+  get indeterminate() { return _domParse("get_form_indeterminate", this._nid) === true; }
+  set indeterminate(v) { _dom("set_form_indeterminate", this._nid, String(!!v)); }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
