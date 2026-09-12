@@ -3361,7 +3361,7 @@ impl Page {
         let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
             url.as_str(),
-            "GET",
+            method,
             "Document",
             response.status,
             &response.headers,
@@ -4769,6 +4769,34 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_navigation_records_the_method_sent_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/submit", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 1024];
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 { break; }
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    if request.len() >= end + 4 + "name=test".len() { break; }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 15\r\nConnection: close\r\n\r\n<h1>posted</h1>").await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut page = frame_page("post-method-regression");
+        page.navigate_with_wait_post(&url, crate::lifecycle::WaitUntil::Load, "POST", "name=test").await.unwrap();
+        assert!(server.await.unwrap().starts_with("POST /submit HTTP/1.1\r\n"));
+        let event = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
+        assert_eq!(event.method, "POST");
+        assert_eq!(event.status, 200);
+    }
 
     #[test]
     fn navigation_timeout_environment_default_remains_thirty_seconds() {
