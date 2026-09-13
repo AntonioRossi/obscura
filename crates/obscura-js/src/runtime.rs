@@ -20232,8 +20232,19 @@ mod subdocument_resource_tests {
         let before = rt.evaluate(&measure).unwrap();
         rt.service_render_resources();
         assert!(rt.has_pending_render_resources(), "measurement must schedule cold resources");
-        assert!(rt.resolve_promises_until(|rt| !rt.has_pending_render_resources(), 5000).await,
-            "default event-loop service must settle child resources without a deadline override");
+        // Drive the same notification/service contract as Page's resource wait.
+        // There need not be pending V8 work while native requests are in flight.
+        let notify = rt.render_resource_notify();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                rt.service_render_resources();
+                if !rt.has_pending_render_resources() { break; }
+                notified.await;
+            }
+        }).await.expect("page resource service must settle child resources without a deadline override");
         let after = rt.evaluate(&measure).unwrap();
         assert_ne!(before[0], after[0], "loaded font must invalidate the fallback geometry");
         assert_eq!(&after.as_array().unwrap()[1..], &[serde_json::json!(37), serde_json::json!(19)]);
