@@ -239,11 +239,13 @@ async fn evaluated_history_navigation_preserves_the_execution_context() {
     let mut ctx = CdpContext::new();
     let page_id = ctx.create_page();
     let session = "history-context";
-    ctx.sessions.insert(session.into(), page_id);
+    ctx.sessions.insert(session.into(), page_id.clone());
     cdp(&mut ctx, 1, "Page.navigate", json!({"url":url}), Some(session)).await;
     cdp(&mut ctx, 2, "Runtime.enable", json!({}), Some(session)).await;
     let context_id = ctx.pending_events.iter().rev()
-        .find(|e| e.method == "Runtime.executionContextCreated").unwrap()
+        .find(|e| e.method == "Runtime.executionContextCreated"
+            && e.params["context"]["auxData"]["frameId"] == page_id
+            && e.params["context"]["auxData"]["isDefault"] == true).unwrap()
         .params["context"]["id"].clone();
     ctx.pending_events.clear();
     cdp(&mut ctx, 3, "Runtime.evaluate", json!({
