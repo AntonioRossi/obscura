@@ -100,3 +100,18 @@ fn synchronous_iframe_browser_interfaces_have_matching_child_instances() {
     assert_eq!(result, json!({"types":vec![json!([true,false,true]);7],
         "stable":true,"inherited":true,"rect":true,"identity":true,"plugins":true}));
 }
+
+#[test]
+fn synchronous_iframe_rectangle_factories_return_child_realm_instances() {
+    let mut rt = runtime();
+    let result = rt.evaluate(r#"(() => {
+        const f = document.createElement('iframe'); document.body.appendChild(f);
+        const w = f.contentWindow;
+        return ['DOMRect', 'DOMRectReadOnly'].map(name => {
+            const rect = w[name].fromRect({x:10, y:20, width:-5, height:-7});
+            return [rect instanceof w[name], rect instanceof globalThis[name],
+                rect.left, rect.bottom];
+        });
+    })()"#).unwrap();
+    assert_eq!(result, json!([[true, false, 5, 20], [true, false, 5, 20]]));
+}

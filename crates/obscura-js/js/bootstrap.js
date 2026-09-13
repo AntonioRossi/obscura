@@ -12601,6 +12601,15 @@ function _iframeRealmGlobal(target, name) {
     Object.defineProperties(proto, Object.getOwnPropertyDescriptors(source.prototype));
     Object.defineProperty(proto, 'constructor', {value, writable: true, configurable: true});
     value.prototype = proto;
+    if (name === 'DOMRect' || name === 'DOMRectReadOnly') {
+      Object.defineProperty(value, 'fromRect', {
+        ...Object.getOwnPropertyDescriptor(source, 'fromRect'),
+        value: _markNative(function fromRect(rect = {}) {
+          const r = _rectDictionary(rect);
+          return new value(r.x, r.y, r.width, r.height);
+        }),
+      });
+    }
   }
   return value;
 }
