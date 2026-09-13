@@ -1947,6 +1947,12 @@ impl ObscuraJsRuntime {
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
                     crate::ops::invalidate_render_resource_geometry(&mut state);
+                } else {
+                    // An image used only by a detached child document is not
+                    // present in the retained parent's geometry dependency set.
+                    for layout in state.subdocument_layouts.values_mut() {
+                        layout.prepared = None;
+                    }
                 }
             }
             _ => state.render_resources.seed_image_missing(url, profile),
@@ -2259,6 +2265,16 @@ impl ObscuraJsRuntime {
     /// the number of loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn service_render_resources(&mut self) -> usize {
+        // Keep the ordinary idle page path allocation-free.
+        if self.realm_states().borrow().is_empty() {
+            let state = self.state.borrow();
+            if state.render_resource_rx.is_empty()
+                && state.render_resource_backlog.is_empty()
+                && !state.render_resources.has_sync_misses()
+            {
+                return 0;
+            }
+        }
         let states = self.render_resource_states();
         let mut available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(states.iter()
             .map(|state| state.borrow().render_resource_in_flight.len()).sum());
@@ -20308,6 +20324,25 @@ mod subdocument_resource_tests {
         assert!(old_tx.is_closed(), "answers racing removal cannot seed retired layout");
         assert!(!rt.has_pending_render_resources());
         assert_eq!(rt.mark_render_resources_in_flight(vec![("https://example.test/extra".into(),None,false)]).len(), 1);
+    }
+
+    #[test]
+    fn iframe_image_completion_refreshes_child_geometry_with_a_retained_parent() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body><div id=parent style='width:200px'></div></body>"));
+        rt.set_url("https://example.test/");
+        rt.run_page_init();
+        rt.evaluate("(() => {const f=document.createElement('iframe');document.body.appendChild(f);f.contentDocument.body.innerHTML='<img src=https://example.test/child.svg>';document.getElementById('parent').getBoundingClientRect();})()").unwrap();
+        let measure = "(() => {const r=document.querySelector('iframe').contentDocument.querySelector('img').getBoundingClientRect();return [r.width,r.height]})()";
+        let before = rt.evaluate(measure).unwrap();
+        assert!(rt.state.borrow().prepared_render.is_some());
+        rt.seed_render_image_resource("https://example.test/child.svg".into(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="37" height="19"></svg>"#.to_vec()));
+        let after = rt.evaluate(measure).unwrap();
+        assert_eq!(after, serde_json::json!([37,19]));
+        assert_ne!(before, after);
     }
 
 }
