@@ -257,7 +257,7 @@ async fn evaluated_history_navigation_preserves_the_execution_context() {
     let result = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
         "expression":"globalThis.retainedValue", "contextId":context_id,
         "returnByValue":true}), Some(session)).await;
-    assert_eq!(result["result"]["value"], 17);
+    assert_eq!(result["result"]["value"].as_f64(), Some(17.0));
 }
 
 #[tokio::test(flavor = "current_thread")]
