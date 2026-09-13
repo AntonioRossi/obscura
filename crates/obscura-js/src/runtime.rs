@@ -905,7 +905,6 @@ impl ObscuraJsRuntime {
         frame.encoding = parent.encoding.clone();
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
-        frame.intercept_block_patterns = parent.intercept_block_patterns.clone();
         frame.page_in_flight = parent.page_in_flight.clone();
         #[cfg(feature = "stealth")]
         {
@@ -915,6 +914,7 @@ impl ObscuraJsRuntime {
         // all background loads share the page's wake-up and concurrency bound.
         #[cfg(feature = "render")]
         {
+            frame.intercept_block_patterns = parent.intercept_block_patterns.clone();
             frame.render_resource_limiter = parent.render_resource_limiter.clone();
             frame.render_resource_notify = parent.render_resource_notify.clone();
             if crate::ops::has_page_transport(&parent) {
