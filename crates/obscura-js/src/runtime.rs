@@ -1950,9 +1950,7 @@ impl ObscuraJsRuntime {
                 } else {
                     // An image used only by a detached child document is not
                     // present in the retained parent's geometry dependency set.
-                    for layout in state.subdocument_layouts.values_mut() {
-                        layout.prepared = None;
-                    }
+                    crate::ops::invalidate_subdocument_resource_geometry(&mut state);
                 }
             }
             _ => state.render_resources.seed_image_missing(url, profile),
