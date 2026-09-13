@@ -1230,10 +1230,15 @@ pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::Re
 /// Coalescing this marker also makes one shared image response invalidate once
 /// rather than once for every HTMLImageElement waiter.
 #[cfg(feature = "render")]
-pub(crate) fn invalidate_render_resource_geometry(state: &mut ObscuraState) {
+pub(crate) fn invalidate_subdocument_resource_geometry(state: &mut ObscuraState) {
     for layout in state.subdocument_layouts.values_mut() {
         layout.prepared = None;
     }
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn invalidate_render_resource_geometry(state: &mut ObscuraState) {
+    invalidate_subdocument_resource_geometry(state);
     if state.prepared_render.is_some()
         && !queue_retained_style_mutation(
             &mut state.pending_style_mutations,
