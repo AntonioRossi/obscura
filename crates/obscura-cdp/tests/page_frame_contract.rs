@@ -216,14 +216,66 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         Some(&session_id),
     )
     .await;
-    let route_frame = &ctx.pending_events[route_event_start..]
+    let route_event = &ctx.pending_events[route_event_start..]
         .iter()
-        .find(|event| {
-            event.method == "Page.frameNavigated" && event.params["frame"]["id"] == page_id
-        })
+        .find(|event| event.method == "Page.navigatedWithinDocument"
+            && event.params["frameId"] == page_id)
         .expect("same-document navigation event was not emitted")
-        .params["frame"];
+        .params;
+    assert!(route_event["url"].as_str().unwrap().ends_with("/next"));
+    assert!(!ctx.pending_events[route_event_start..].iter().any(|event|
+        event.method == "Page.frameNavigated" || event.method == "Runtime.executionContextsCleared"));
+    let route_tree = cdp(&mut ctx, 10, "Page.getFrameTree", json!({}), Some(&session_id)).await;
+    let route_frame = &route_tree["frameTree"]["frame"];
     assert_frame_contract(route_frame);
     assert_eq!(route_frame["loaderId"], loader_id);
     assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn evaluated_history_navigation_preserves_the_execution_context() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "history-context";
+    ctx.sessions.insert(session.into(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":url}), Some(session)).await;
+    cdp(&mut ctx, 2, "Runtime.enable", json!({}), Some(session)).await;
+    let context_id = ctx.pending_events.iter().rev()
+        .find(|e| e.method == "Runtime.executionContextCreated").unwrap()
+        .params["context"]["id"].clone();
+    ctx.pending_events.clear();
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({
+        "expression":"globalThis.retainedValue=17;history.pushState({},'', '/history')",
+        "contextId":context_id}), Some(session)).await;
+    assert!(ctx.pending_events.iter().any(|e| e.method == "Page.navigatedWithinDocument"));
+    assert!(!ctx.pending_events.iter().any(|e|
+        e.method == "Runtime.executionContextsCleared" || e.method == "Page.frameNavigated"));
+    let result = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
+        "expression":"globalThis.retainedValue", "contextId":context_id,
+        "returnByValue":true}), Some(session)).await;
+    assert_eq!(result["result"]["value"], 17);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clicked_data_url_emits_a_new_document_lifecycle() {
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "data-navigation";
+    ctx.sessions.insert(session.into(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":"data:text/html,<body><button id=b>Go</button></body>"}), Some(session)).await;
+    cdp(&mut ctx, 2, "Runtime.enable", json!({}), Some(session)).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":
+        "document.elementFromPoint=()=>document.getElementById('b');document.getElementById('b').onclick=()=>location.href='data:text/html,<title>Destination</title><h1>Done</h1>'"}), Some(session)).await;
+    ctx.pending_events.clear();
+    for (id, kind) in [(4,"mousePressed"),(5,"mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent", json!({"type":kind,"x":0,"y":0,"button":"left","clickCount":1}), Some(session)).await;
+    }
+    assert!(ctx.pending_events.iter().any(|e| e.method == "Page.frameNavigated"));
+    assert!(ctx.pending_events.iter().any(|e| e.method == "Page.lifecycleEvent" && e.params["name"] == "load"));
+    assert!(ctx.pending_events.iter().any(|e| e.method == "Runtime.executionContextsCleared"));
+    assert!(!ctx.pending_events.iter().any(|e| e.method == "Page.navigatedWithinDocument"));
+    let result = cdp(&mut ctx, 6, "Runtime.evaluate", json!({"expression":"document.title", "returnByValue":true}), Some(session)).await;
+    assert_eq!(result["result"]["value"], "Destination");
 }
