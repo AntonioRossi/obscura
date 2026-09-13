@@ -668,15 +668,20 @@ impl RealmStates {
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
-        self.entries.retain(|(known, _, state)| {
+        self.entries.retain(|(known, _, _frame)| {
             if known == context {
                 #[cfg(feature = "render")]
-                abandon_state_render_resources(&mut state.borrow_mut());
+                abandon_state_render_resources(&mut _frame.borrow_mut());
                 false
             } else {
                 true
             }
         });
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     #[cfg(feature = "render")]
