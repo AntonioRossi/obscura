@@ -2480,6 +2480,39 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Strip headers that must not survive a redirect. On a redirect that changes
+/// origin, credential headers (`Authorization`, `Proxy-Authorization`, an
+/// explicit `Cookie`) are removed so they are not forwarded to a different
+/// origin — matching browsers and the Fetch spec (a cross-origin redirect must
+/// not leak the caller's credentials). When a 301/302/303 downgrades the method
+/// to GET, the request-body headers are removed since the body is dropped.
+fn sanitize_redirect_headers(
+    headers: &mut HashMap<String, String>,
+    crosses_origin: bool,
+    downgraded_to_get: bool,
+) {
+    if crosses_origin {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            )
+        });
+    }
+    if downgraded_to_get {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-encoding"
+                    | "content-language"
+                    | "content-location"
+            )
+        });
+    }
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2942,6 +2975,16 @@ async fn op_fetch_url(
         let preflight = ordinary_preflight.await;
         let (preflight_status, preflight_headers) = preflight.map_err(|e|
             deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+
+        // Fetch spec: the preflight response's status must be an ok status
+        // before its CORS headers are consulted (#973).
+        if !preflight_status.is_success() {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight returned HTTP {}",
+                preflight_status
+            )));
+        }
+
         let allowed_origin = preflight_headers.get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok()).unwrap_or("");
         let allow_credentials = preflight_headers.get("access-control-allow-credentials")
@@ -2950,12 +2993,6 @@ async fn op_fetch_url(
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
-            )));
-        }
-        if !preflight_status.is_success() {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "CORS preflight returned HTTP {}",
-                preflight_status
             )));
         }
 
@@ -3024,6 +3061,9 @@ async fn op_fetch_url(
     let mut current_url = url.clone();
     let mut current_method = req_method;
     let mut current_body = body;
+    // A mutable copy applied per hop: credential headers are dropped when a
+    // redirect crosses origin, and body headers when the method downgrades.
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
@@ -3055,7 +3095,7 @@ async fn op_fetch_url(
         // Send a default User-Agent on fetch()/XHR requests (the navigation path
         // sets one, but this op did not, so scripted requests went out with no UA
         // and UA-gated servers rejected them). Honor an explicit override.
-        if !custom_headers
+        if !current_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
         {
@@ -3065,7 +3105,7 @@ async fn op_fetch_url(
             );
         }
 
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -3102,6 +3142,33 @@ async fn op_fetch_url(
 
         if !resp.status().is_redirection() {
             break resp;
+        }
+
+        // Fetch spec: the CORS check applies to every response in cors mode,
+        // not only the final one. A cross-origin redirect response must be
+        // authorized before it is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = resp
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let allow_credentials = resp
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
 
         let location_header = resp
@@ -3152,10 +3219,17 @@ async fn op_fetch_url(
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         // 307/308 preserve method and body.
         let status_code = resp.status().as_u16();
-        if status_code == 301 || status_code == 302 || status_code == 303 {
+        let downgraded_to_get =
+            status_code == 301 || status_code == 302 || status_code == 303;
+        if downgraded_to_get {
             current_method = reqwest::Method::GET;
             current_body.clear();
         }
+
+        // Do not forward the caller's credentials to a different origin, and
+        // drop the body headers once the body is gone (#967).
+        let crosses_origin = base.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
 
         redirected_from.push(base);
         current_url = next_url.to_string();
@@ -3333,6 +3407,9 @@ async fn stealth_fetch_all(
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
+    // Applied per hop; credential headers are dropped on a cross-origin
+    // redirect and body headers on a GET downgrade (#967).
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = request_origin(&current_url)
@@ -3356,7 +3433,7 @@ async fn stealth_fetch_all(
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
@@ -3375,6 +3452,31 @@ async fn stealth_fetch_all(
 
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body);
+        }
+        // Cross-origin redirect responses must pass the CORS check too, before
+        // the redirect is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = r
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str)
+                .unwrap_or("");
+            let allow_credentials = r
+                .headers
+                .get("access-control-allow-credentials")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
         let Some(location) = r.headers.get("location").cloned() else {
             break (r.status, r.headers, r.body);
@@ -3403,10 +3505,14 @@ async fn stealth_fetch_all(
             .to_string());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
-        if r.status == 301 || r.status == 302 || r.status == 303 {
+        let downgraded_to_get = r.status == 301 || r.status == 302 || r.status == 303;
+        if downgraded_to_get {
             current_method = "GET".to_string();
             current_body.clear();
         }
+        // Do not forward credentials to a different origin (#967).
+        let crosses_origin = parsed_current.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
@@ -3509,10 +3615,44 @@ mod tests {
         cors_response_allows, cors_unsafe_request_header_names, glob_match,
         is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
-        validate_fetch_url, FetchCredentials, ObscuraState,
+        sanitize_redirect_headers, validate_fetch_url, FetchCredentials, ObscuraState,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    // #967 — a redirect must not forward the caller's credentials to a
+    // different origin, and a 301/302/303 GET downgrade drops the body headers.
+    #[test]
+    fn redirect_strips_credentials_cross_origin_and_body_headers_on_get() {
+        let base = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("Authorization".to_string(), "Bearer secret".to_string());
+            h.insert("Cookie".to_string(), "sid=1".to_string());
+            h.insert("Content-Type".to_string(), "application/json".to_string());
+            h.insert("X-Keep".to_string(), "yes".to_string());
+            h
+        };
+
+        // Cross-origin redirect, method preserved: drop credential headers,
+        // keep the body header and any custom header.
+        let mut cross = base();
+        sanitize_redirect_headers(&mut cross, true, false);
+        assert!(!cross.contains_key("Authorization"), "Authorization must be stripped cross-origin");
+        assert!(!cross.contains_key("Cookie"), "explicit Cookie must be stripped cross-origin");
+        assert!(cross.contains_key("Content-Type"));
+        assert!(cross.contains_key("X-Keep"));
+
+        // Same-origin 301/302/303 GET downgrade: keep credentials, drop body headers.
+        let mut downgrade = base();
+        sanitize_redirect_headers(&mut downgrade, false, true);
+        assert!(downgrade.contains_key("Authorization"), "Authorization kept on same-origin redirect");
+        assert!(!downgrade.contains_key("Content-Type"), "Content-Type dropped on GET downgrade");
+
+        // Same-origin, method preserved: nothing stripped.
+        let mut same = base();
+        sanitize_redirect_headers(&mut same, false, false);
+        assert_eq!(same.len(), 4, "nothing stripped when same-origin and method preserved");
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;

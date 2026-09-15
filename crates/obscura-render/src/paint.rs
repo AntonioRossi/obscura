@@ -2501,6 +2501,22 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
     {
         return Some(previous);
     }
+    if previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+        && crate::dom::can_retain_layout_for_tabindex(
+            tree,
+            viewport,
+            stylesheet_cache,
+            mutations,
+        )
+        && (!sample_changed
+            || (forward_document_sample
+                && previous.advance_inactive_animation_sample_time(animation_sample.time)))
+    {
+        return Some(previous);
+    }
     let sampled_animation_mutations = sample_changed
         .then(|| {
             retained_animation_restyle_mutations(

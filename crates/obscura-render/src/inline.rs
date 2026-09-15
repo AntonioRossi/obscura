@@ -688,11 +688,27 @@ type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 /// directly, while the upper half is a one-based index into an optional
 /// variation-set table.
 const META_UNDERLINE: usize = 1;
-const META_FILL_SHIFT: usize = 1;
+const META_OVERLINE: usize = 2;
+const META_LINE_THROUGH: usize = 4;
+const META_DECORATIONS: usize = META_UNDERLINE | META_OVERLINE | META_LINE_THROUGH;
+const META_FILL_SHIFT: usize = 3;
 const META_VARIATION_BITS: usize = usize::BITS as usize / 2;
 const META_VARIATION_SHIFT: usize = usize::BITS as usize - META_VARIATION_BITS;
 const META_VARIATION_MASK: usize = ((1usize << META_VARIATION_BITS) - 1) << META_VARIATION_SHIFT;
-const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_UNDERLINE;
+const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_DECORATIONS;
+
+fn decoration_stroke(
+    (start, end, size, color, relative): (f32, f32, f32, [u8; 4], (f32, f32)),
+    baseline: f32,
+    flag: usize,
+) -> (f32, f32, f32, f32, [u8; 4]) {
+    let offset = match flag {
+        META_OVERLINE => -size * 0.8,
+        META_LINE_THROUGH => -size * 0.3,
+        _ => (size * 0.12).max(1.0),
+    };
+    (start, end, baseline + relative.1 + offset, (size / 14.0).max(1.0), color)
+}
 
 fn metadata_fill(metadata: usize) -> Option<usize> {
     ((metadata & META_FILL_MASK) >> META_FILL_SHIFT).checked_sub(1)
@@ -764,6 +780,8 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Exact measurement results retained across repeated Taffy probes.
+    measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1467,6 +1485,8 @@ impl TextEngine {
             italic: context.italic,
             synthetic_italic: context.synthetic_italic,
             underline: context.underline,
+            overline: context.overline,
+            line_through: context.line_through,
             color: context.color,
             family: context.family,
             clip_fill: context.clip_fill,
@@ -1718,6 +1738,7 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            measured: Vec::new(),
         });
         Some(idx)
     }
@@ -1738,20 +1759,33 @@ impl TextEngine {
     }
 
     fn measure_text_with_wrap(&mut self, idx: usize, width: Option<f32>, wrap: Wrap) -> (f32, f32) {
+        let key = width.map(f32::to_bits);
+        if let Some((_, _, size)) = self.items[idx]
+            .measured
+            .iter()
+            .find(|(cached_width, cached_wrap, _)| *cached_width == key && *cached_wrap == wrap)
+        {
+            return *size;
+        }
         let TextEngine {
             font_system, items, ..
         } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
         let (width, height, clamped) = buffer_size(item);
-        (
+        let size = (
             width,
             if clamped {
                 height
             } else {
                 height.max(item.forced_min_height)
             },
-        )
+        );
+        if item.measured.len() == 16 {
+            item.measured.remove(0);
+        }
+        item.measured.push((key, wrap, size));
+        size
     }
 
     /// Exact max-content size for one fallback word item. Paragraph IFCs keep
@@ -2085,6 +2119,8 @@ struct SpanAttrs {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     color: [u8; 4],
     family: Arc<str>,
     clip_fill: Option<usize>,
@@ -2186,7 +2222,12 @@ impl SpanAttrs {
             word_break,
             overflow_wrap,
         });
-        a = a.metadata(fill | variation | usize::from(self.underline));
+        a = a.metadata(
+            fill | variation
+                | usize::from(self.underline) * META_UNDERLINE
+                | usize::from(self.overline) * META_OVERLINE
+                | usize::from(self.line_through) * META_LINE_THROUGH,
+        );
         a
     }
 }
@@ -2207,6 +2248,8 @@ struct SpanCtx {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
     overflow_wrap: crate::OverflowWrap,
@@ -2350,6 +2393,8 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         italic: base.font_style_italic.unwrap_or(false),
         synthetic_italic: font.synthetic_italic,
         underline: base.underline.unwrap_or(false),
+        overline: base.overline.unwrap_or(false),
+        line_through: base.line_through.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
         overflow_wrap: base.overflow_wrap.unwrap_or_default(),
@@ -2403,6 +2448,8 @@ fn collect_node_spans(
                 italic: ctx.italic,
                 synthetic_italic: ctx.synthetic_italic,
                 underline: ctx.underline,
+                overline: ctx.overline,
+                line_through: ctx.line_through,
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
@@ -2435,6 +2482,8 @@ fn collect_node_spans(
                         italic: ctx.italic,
                         synthetic_italic: ctx.synthetic_italic,
                         underline: ctx.underline,
+                        overline: ctx.overline,
+                        line_through: ctx.line_through,
                         color: ctx.color,
                         family: Arc::clone(&ctx.family),
                         clip_fill: ctx.clip_fill,
@@ -2513,6 +2562,8 @@ fn collect_node_spans(
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
+                overline: ctx.overline || style.and_then(|style| style.overline).unwrap_or(false),
+                line_through: ctx.line_through || style.and_then(|style| style.line_through).unwrap_or(false),
                 transform: style
                     .and_then(|s| s.text_transform)
                     .unwrap_or(ctx.transform),
@@ -3406,10 +3457,6 @@ impl TextEngine {
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
 
-        // Collect underline segments before drawing glyphs (both borrow the
-        // buffer). Underline is carried per glyph via metadata; group runs of
-        // consecutive underlined glyphs on a line into one stroke below the
-        // baseline. Done first so the draw() mutable borrow does not overlap.
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
         let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> = vec![None; item.clip_fills.len()];
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
@@ -3423,7 +3470,8 @@ impl TextEngine {
             let inline_alignment =
                 line_edge_alignment_shift(item, line_source_start, line_source_end);
             let base_y = run.line_y;
-            let mut seg: Option<(f32, f32, f32, [u8; 4], (f32, f32))> = None;
+            let mut segments: [Option<(f32, f32, f32, [u8; 4], (f32, f32))>; 3] = [None; 3];
+            let mut active_decorations = 0;
             for g in run.glyphs {
                 // Keep decoration and background-clip bounds in lockstep with
                 // glyph painting. A truncated glyph must not leave an
@@ -3447,7 +3495,7 @@ impl TextEngine {
                         line_source_start,
                         line_source_end,
                     );
-                let underlined = g.metadata & META_UNDERLINE != 0;
+                let decoration_flags = g.metadata & META_DECORATIONS;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
@@ -3474,51 +3522,42 @@ impl TextEngine {
                 if print_economy {
                     col = crate::paint::print_economy_color(col);
                 }
-                if underlined {
-                    match &mut seg {
-                        Some((_, x1, fs, c, prior_relative))
-                            if *c == col && *prior_relative == relative =>
-                        {
-                            *x1 = g.x + line_offset + g.w + relative.0;
-                            *fs = fs.max(g.font_size);
-                        }
-                        _ => {
-                            if let Some((x0, x1, fs, c, prior_relative)) = seg.take() {
-                                underlines.push((
-                                    x0,
-                                    x1,
-                                    base_y + prior_relative.1 + (fs * 0.12).max(1.0),
-                                    (fs / 14.0).max(1.0),
-                                    c,
+                if decoration_flags | active_decorations == 0 {
+                    continue;
+                }
+                active_decorations = decoration_flags;
+                for (index, flag) in [META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH].into_iter().enumerate() {
+                    let segment = &mut segments[index];
+                    if decoration_flags & flag != 0 {
+                        match segment {
+                            Some((_, end, size, color, prior_relative))
+                                if *color == col && *prior_relative == relative =>
+                            {
+                                *end = g.x + line_offset + g.w + relative.0;
+                                *size = size.max(g.font_size);
+                            }
+                            _ => {
+                                if let Some(previous) = segment.take() {
+                                    underlines.push(decoration_stroke(previous, base_y, flag));
+                                }
+                                *segment = Some((
+                                    g.x + line_offset + relative.0,
+                                    g.x + line_offset + g.w + relative.0,
+                                    g.font_size,
+                                    col,
+                                    relative,
                                 ));
                             }
-                            seg = Some((
-                                g.x + line_offset + relative.0,
-                                g.x + line_offset + g.w + relative.0,
-                                g.font_size,
-                                col,
-                                relative,
-                            ));
                         }
+                    } else if let Some(previous) = segment.take() {
+                        underlines.push(decoration_stroke(previous, base_y, flag));
                     }
-                } else if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                    underlines.push((
-                        x0,
-                        x1,
-                        base_y + relative.1 + (fs * 0.12).max(1.0),
-                        (fs / 14.0).max(1.0),
-                        c,
-                    ));
                 }
             }
-            if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                underlines.push((
-                    x0,
-                    x1,
-                    base_y + relative.1 + (fs * 0.12).max(1.0),
-                    (fs / 14.0).max(1.0),
-                    c,
-                ));
+            for (segment, flag) in segments.into_iter().zip([META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH]) {
+                if let Some(previous) = segment {
+                    underlines.push(decoration_stroke(previous, base_y, flag));
+                }
             }
         }
 
@@ -3818,6 +3857,63 @@ mod tests {
         assert!(
             cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
         );
+    }
+
+    #[test]
+    fn repeated_measurements_reuse_exact_results_and_preserve_final_paint() {
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>alpha <span id='inline'>beta gamma delta epsilon</span> zeta</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let base = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            text_indent: Some(Dimension::Px(7.25)),
+            ..Default::default()
+        };
+        let child = LayoutStyle {
+            display: Display::Inline,
+            padding: crate::Edges {
+                left: 3.5,
+                right: 2.25,
+                ..Default::default()
+            },
+            ..base.clone()
+        };
+        let styles = HashMap::from([(copy, base), (inline, child)]);
+        let mut engine = TextEngine::new();
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+
+        for (width, wrap) in [
+            (None, Wrap::WordOrGlyph),
+            (Some(0.0), Wrap::WordOrGlyph),
+            (Some(100.01), Wrap::None),
+            (Some(100.49), Wrap::WordOrGlyph),
+            (Some(100.51), Wrap::Glyph),
+        ] {
+            let actual = engine.measure_text_with_wrap(item, width, wrap);
+            let cached_entries = engine.items[item].measured.len();
+            assert_eq!(
+                engine.measure_text_with_wrap(item, width, wrap),
+                actual
+            );
+            assert_eq!(engine.items[item].measured.len(), cached_entries);
+
+            let mut fresh = TextEngine::new();
+            let fresh_item = fresh.try_build(&tree, copy, &styles).unwrap();
+            assert_eq!(
+                actual,
+                fresh.measure_text_with_wrap(fresh_item, width, wrap)
+            );
+            engine.finalize(item, (0.0, 0.0), 100.49, None);
+            fresh.finalize(fresh_item, (0.0, 0.0), 100.49, None);
+            let mut actual_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            let mut expected_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            engine.paint_item(item, &mut actual_image, (0.0, 0.0));
+            fresh.paint_item(fresh_item, &mut expected_image, (0.0, 0.0));
+            assert_eq!(actual_image.data(), expected_image.data());
+        }
     }
 
     #[test]
@@ -4410,6 +4506,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: true,
+            overline: true,
+            line_through: true,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
@@ -4418,7 +4516,7 @@ mod tests {
             word_break: crate::WordBreak::Normal,
         };
         let shaped = attrs.to_attrs(42);
-        assert_ne!(shaped.metadata & META_UNDERLINE, 0);
+        assert_eq!(shaped.metadata & META_DECORATIONS, META_DECORATIONS);
         assert_eq!(metadata_fill(shaped.metadata), Some(37));
         assert_eq!(metadata_variation(shaped.metadata), Some(41));
         assert_eq!(
@@ -4490,6 +4588,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: false,
+            overline: false,
+            line_through: false,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             clip_fill: None,

@@ -2138,6 +2138,12 @@ class Node {
   }
   appendChild(c) {
     if (!c) return c;
+    if (this instanceof CharacterData) {
+      throw new DOMException(
+        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
+        "HierarchyRequestError",
+      );
+    }
     if (c instanceof DocumentFragment) {
       const children = Array.from(c.childNodes);
       for (const child of children) this.appendChild(child);
@@ -2275,7 +2281,10 @@ class Node {
     }
     return n;
   }
-  contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
+  contains(o) {
+    if (o === this) return true;
+    return o ? _dom("contains", this._nid, o._nid) === "true" : false;
+  }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
@@ -2384,7 +2393,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this._nid === other._nid; }
+  isSameNode(other) { return !!other && this._nid === other._nid; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -2401,27 +2410,46 @@ class CharacterData extends Node {
   }
   set data(v) {
     const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    _dom("set_text_content", this._nid, v === null ? "" : String(v));
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
-    return this.data.substring(offset, offset + count);
-  }
-  appendData(s) { this.data += s; }
-  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.substringData requires 2 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    return d.slice(offset, offset + count);
+  }
+  appendData(s) {
+    if (arguments.length < 1) throw new TypeError("CharacterData.appendData requires 1 argument");
+    this.data = this.data + String(s);
+  }
+  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.insertData requires 2 arguments");
+    const d = this.data;
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset);
   }
   deleteData(offset, count) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.deleteData requires 2 arguments");
     const d = this.data;
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
     this.data = d.slice(0, offset) + d.slice(offset + count);
   }
   replaceData(offset, count, s) {
+    if (arguments.length < 3) throw new TypeError("CharacterData.replaceData requires 3 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset + count);
   }
 }
 
@@ -2431,8 +2459,10 @@ class Text extends CharacterData {
   get wholeText() { return this.data; }
   splitText(offset) {
     const d = this.data;
-    const tail = d.substring(offset);
-    this.data = d.substring(0, offset);
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    const tail = d.slice(offset);
+    this.data = d.slice(0, offset);
     const newNid = +_dom("create_text_node", tail);
     const parent = this.parentNode;
     if (parent) {
@@ -5350,7 +5380,10 @@ class Document extends Node {
   }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
-  getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
+  getElementById(id) {
+    const needle = String(id);
+    return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all", s) || [];
@@ -7239,7 +7272,11 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (request ? request.method : "GET");
+  // Normalize the method to uppercase, matching the Request constructor, so
+  // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
+  // and lowercase standard methods are not rejected by the case-sensitive CORS
+  // checks (#969).
+  const method = String(init.method || (request ? request.method : "GET")).toUpperCase();
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
   const inheritsRequestBody = init.body === undefined && request !== null;
