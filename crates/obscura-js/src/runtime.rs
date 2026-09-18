@@ -6585,6 +6585,80 @@ mod tests {
     }
 
     #[test]
+    fn character_data_uses_webidl_ranges_and_rejects_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const errorName = callback => {
+                    try { callback(); return null; } catch (error) { return error.name; }
+                  };
+                  const data = document.createTextNode("test");
+                  data.data = undefined;
+                  const undefinedData = data.data;
+                  data.data = null;
+
+                  const appended = document.createTextNode("a");
+                  appended.appendData(null);
+                  const inserted = document.createTextNode("test");
+                  inserted.insertData(-0x100000000 + 2, "X");
+                  const deleted = document.createTextNode("test");
+                  deleted.deleteData(2, -1);
+                  const replaced = document.createTextNode("test");
+                  replaced.replaceData(2, -1, "yo");
+                  const substring = document.createTextNode("test");
+
+                  return [
+                    undefinedData, data.data, appended.data, inserted.data,
+                    deleted.data, replaced.data,
+                    substring.substringData(-0x100000000 + 2, 1),
+                    errorName(() => substring.substringData(5, 0)),
+                    errorName(() => substring.substringData()),
+                    errorName(() => substring.splitText(5)),
+                    errorName(() => substring.appendChild(document.createComment("child")))
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "undefined", "", "anull", "teXst", "te", "teyo", "s",
+                "IndexSizeError", "TypeError", "IndexSizeError", "HierarchyRequestError"
+            ])
+        );
+    }
+
+    #[test]
+    fn node_identity_and_element_id_follow_dom_conversion_rules() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id=""></div><div id="null"></div><div id="undefined"></div></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const node = document.body.firstChild;
+                  return [
+                    node.contains(node),
+                    node.isSameNode(null),
+                    document.getElementById("") === null,
+                    document.getElementById(null)?.id,
+                    document.getElementById(undefined)?.id
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, "null", "undefined"])
+        );
+    }
+
+    #[test]
     fn document_title_setter_creates_missing_title_element() {
         let mut rt = setup_runtime("<html><body><main>content</main></body></html>");
         let result = rt
@@ -16889,6 +16963,43 @@ mod tests {
         );
     }
 
+    // #969: fetch() must normalize the request method to uppercase, matching the
+    // Request constructor, so a lowercase standard method is not wrongly
+    // rejected by the case-sensitive CORS checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_normalizes_request_method_to_uppercase() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const original = Deno.core.ops.op_fetch_url;
+                let captured = null;
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method) => {
+                        captured = method;
+                        return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
+                    };
+                    await fetch(new URL("/api", document.URL), { method: "delete" });
+                    return captured;
+                } finally {
+                    Deno.core.ops.op_fetch_url = original;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!("DELETE"),
+            "fetch() must uppercase the method like the Request constructor"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_and_xhr_forward_browser_credentials_modes() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -17395,6 +17506,77 @@ mod tests {
         });
 
         redirect_runtime_for_origin(&format!("http://{source_address}"))
+    }
+
+    // A redirector (cross-origin to the page) whose 302 carries no
+    // Access-Control-Allow-Origin, pointing at its own /final which does allow.
+    // Returns the runtime (page on a distinct origin) and the redirector base.
+    fn cross_origin_intermediate_redirect_runtime() -> (ObscuraJsRuntime, String) {
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_address = redirector.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = redirector.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let request = String::from_utf8_lossy(&buffer);
+                let response = if request.contains("/final") {
+                    "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                } else {
+                    // 302 WITHOUT Access-Control-Allow-Origin.
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        // The page lives on a distinct origin, so the fetch is cross-origin.
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page.local_addr().unwrap();
+        drop(page);
+
+        (
+            redirect_runtime_for_origin(&format!("http://{page_address}")),
+            format!("http://{redirector_address}"),
+        )
+    }
+
+    // #973: in cors mode, a cross-origin redirect response that lacks
+    // Access-Control-Allow-Origin must be rejected before it is followed, even
+    // if the final destination would authorize the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_mode_blocks_unauthorized_cross_origin_redirect_hop() {
+        let (mut rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        try {{
+                            await fetch("{redirector}/start", {{ mode: "cors" }});
+                            return "allowed";
+                        }} catch (e) {{
+                            return "blocked";
+                        }}
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!("blocked"),
+            "a cross-origin redirect without Access-Control-Allow-Origin must be blocked in cors mode"
+        );
     }
 
     /// HTTP-redirect fetch returns a network error as soon as the

@@ -80,13 +80,13 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven3.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
-      <b>Why <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">NodeMaven</a>?</b><br>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">NodeMaven</a>?</b><br>
       ZIP targeting<br>
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
