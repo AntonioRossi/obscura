@@ -6106,7 +6106,7 @@ pub(crate) fn ensure_prepared_render(
                         animation_sample,
                         &mut state.animation_timeline,
                     )?,
-                    obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                    _ => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
                         dom,
                         viewport,
                         base_url.as_deref(),
@@ -6793,7 +6793,15 @@ fn subdocument_layout(state: &OpState, request: &str, frame_id: u32) -> String {
         // client. Page resource preparation populates this shared cache using
         // the native cookie/proxy/CORS-aware transport, then invalidates layout.
         let prepared = crate::runtime::with_sync_render_loading_disabled(&mut gs, |gs| {
-            obscura_render::prepare_dom(&tree, viewport, Some(&request.url), &mut gs.render_resources)
+            if gs.render_media == obscura_render::CssMediaType::Screen {
+                obscura_render::prepare_dom(&tree, viewport, Some(&request.url), &mut gs.render_resources)
+            } else {
+                obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                    &tree, viewport, Some(&request.url), &mut gs.render_resources,
+                    &gs.dynamic_fonts, &mut obscura_render::StylesheetCache::default(),
+                    gs.render_media, gs.animation_sample, &mut obscura_render::AnimationTimelineState::default(),
+                )
+            }
         });
         let Some(prepared) = prepared else { return String::new(); };
         // Bound retention when a page repeatedly creates and removes frames.

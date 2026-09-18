@@ -1433,6 +1433,7 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 globalThis.__obscura_recompute_media_queries();\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
@@ -1445,6 +1446,21 @@ impl ObscuraJsRuntime {
                  }}",
             ),
         );
+    }
+
+    /// Keep JavaScript media queries and CSS selection on the same preference.
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        #[cfg(feature = "render")]
+        {
+            let media = self.state.borrow().render_media.with_reduced_motion(reduce);
+            self.set_render_media(media);
+            self.state.borrow_mut().subdocument_layouts.clear();
+        }
+        let _ = self.execute_runtime_script("<reduced-motion>", format!(
+            "globalThis.__obscura_reduced_motion={reduce};\
+             globalThis.__obscura_recompute_media_queries();\
+             _domMutationEpoch++;"
+        ));
     }
 
     /// Override the physical screen metrics exposed to page JavaScript.
@@ -1523,6 +1539,11 @@ impl ObscuraJsRuntime {
     /// Select the CSS media type for the next synchronous render flush.
     /// Changing media invalidates geometry and the compiled stylesheet key but
     /// leaves the live DOM, scroll offsets, and resource bytes untouched.
+    #[cfg(feature = "render")]
+    pub fn prefers_reduced_motion(&self) -> bool {
+        self.state.borrow().render_media.reduced_motion()
+    }
+
     #[cfg(feature = "render")]
     pub fn set_render_media(
         &self,
