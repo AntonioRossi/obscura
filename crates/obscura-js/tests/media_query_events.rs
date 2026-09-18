@@ -32,3 +32,39 @@ async fn media_query_list_delivers_changes_and_honors_listener_lifecycle() {
     assert_eq!(rt.evaluate("[q instanceof MediaQueryList, q instanceof EventTarget, q.matches]").unwrap(), json!([true, true, true]));
     assert_eq!(rt.evaluate("(() => { try { new MediaQueryList(); } catch(e) { return e.name; } })()").unwrap(), json!("TypeError"));
 }
+
+#[test]
+fn media_query_property_handler_is_independent_and_keeps_listener_order() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<body></body>"));
+    rt.run_page_init();
+    let result = rt.evaluate(r#"(() => {
+        const q = matchMedia('(min-width: 1px)'), seen = [], results = [];
+        const shared = () => seen.push('shared');
+        const emit = () => {
+            seen.length = 0;
+            q.dispatchEvent(new MediaQueryListEvent('change'));
+            results.push(seen.slice());
+        };
+        q.addEventListener('change', shared);
+        q.onchange = shared;
+        q.addEventListener('change', () => seen.push('last'));
+        emit();
+        q.onchange = () => seen.push('replacement');
+        emit();
+        q.onchange = null;
+        emit();
+        q.onchange = shared;
+        emit();
+        q.removeEventListener('change', shared);
+        emit();
+        return results;
+    })()"#).unwrap();
+    assert_eq!(result, json!([
+        ["shared", "shared", "last"],
+        ["shared", "replacement", "last"],
+        ["shared", "last"],
+        ["shared", "last", "shared"],
+        ["last", "shared"]
+    ]));
+}
