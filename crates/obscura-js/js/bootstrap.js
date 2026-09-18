@@ -15051,9 +15051,16 @@ globalThis.MediaQueryList = class MediaQueryList {
   get onchange() { return _mediaQueryState.get(this).onchange; }
   set onchange(value) {
     const state = _mediaQueryState.get(this);
-    if (state.onchange) this.removeEventListener('change', state.onchange);
     state.onchange = typeof value === 'function' ? value : null;
-    if (state.onchange) this.addEventListener('change', state.onchange);
+    // The event-handler slot is independent of an explicitly registered
+    // callback, and replacing its value preserves its position in the list.
+    if (state.onchange && !state.onchangeListener) {
+      state.onchangeListener = event => state.onchange?.call(this, event);
+      this.addEventListener('change', state.onchangeListener);
+    } else if (!state.onchange && state.onchangeListener) {
+      this.removeEventListener('change', state.onchangeListener);
+      state.onchangeListener = null;
+    }
   }
   addListener(callback) { this.addEventListener('change', callback); }
   removeListener(callback) { this.removeEventListener('change', callback); }
