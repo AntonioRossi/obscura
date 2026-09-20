@@ -694,7 +694,7 @@ impl RealmStates {
         self.entries.iter().map(|(_, _, state)| state.clone()).collect()
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
