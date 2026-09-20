@@ -653,10 +653,13 @@ async function _loadLinkedStylesheet(c) {
   try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
   try {
     const loaded = await _fetchLinkedCss(fullUrl, pageOrigin);
-    __obscuraCore.ops.op_external_stylesheet_set(
+    const changed = __obscuraCore.ops.op_external_stylesheet_set(
       c._nid, loaded.css, loaded.responseUrl, loaded.originClean,
       globalThis.__obscura_frameId || 0
     );
+    // Private CSS does not mutate a DOM node. Invalidate live style snapshots
+    // and detached iframe layouts even if they were read before this load.
+    if (changed) _domMutationEpoch++;
     _registerLinkedStylesheet(c, loaded.responseUrl);
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
