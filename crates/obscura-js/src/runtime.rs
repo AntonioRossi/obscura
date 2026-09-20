@@ -20868,6 +20868,51 @@ mod subdocument_resource_tests {
         assert_eq!(rt.evaluate("document.documentElement.outerHTML.includes('main.woff2') || document.querySelector('iframe').contentDocument.documentElement.outerHTML.includes('child.woff2')").unwrap(), serde_json::json!(false));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_layout_observes_a_stylesheet_loaded_after_its_first_read() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url("http://example.com/test");
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const original = __obscura_test_ops.op_fetch_url;
+            const frame = document.createElement('iframe');
+            frame.style.cssText = 'width:300px;height:150px';
+            document.body.appendChild(frame);
+            try {
+                let finish;
+                __obscura_test_ops.op_fetch_url = url => new Promise(resolve => {
+                    finish = () => resolve(JSON.stringify({status:200, headers:{}, url,
+                        body:'.probe{width:123px;height:45px}'}));
+                });
+                const doc = frame.contentDocument;
+                doc.body.innerHTML = '<div class="probe"></div>';
+                const box = doc.querySelector('div');
+                const link = doc.createElement('link');
+                link.rel = 'stylesheet'; link.href = 'http://example.com/late.css';
+                const loaded = new Promise(resolve => link.addEventListener('load', resolve));
+                doc.head.appendChild(link);
+                const live = getComputedStyle(box);
+                const read = () => {
+                    const r = box.getBoundingClientRect();
+                    return [r.width, r.height, live.width];
+                };
+                const before = read();
+                finish(); await loaded;
+                const after = read();
+                const privateCss = !doc.documentElement.outerHTML.includes('width:123px');
+                link.remove();
+                return [before[0] !== 123, after, read()[0] === before[0], privateCss];
+            } finally {
+                __obscura_test_ops.op_fetch_url = original;
+                frame.remove();
+            }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.as_ref().unwrap_or_else(|| panic!("{result:?}")), &serde_json::json!([
+            true, [123,45,"123px"], true, true
+        ]));
+    }
+
     #[test]
     fn iframe_geometry_never_opens_the_synchronous_compatibility_transport() {
         let mut rt = ObscuraJsRuntime::new();
