@@ -1555,6 +1555,8 @@ pub struct LayoutStyle {
     /// text, so it is propagated into the shaped spans of the element's subtree
     /// (this is what underlines links, which are underlined by UA default).
     pub underline: Option<bool>,
+    pub overline: Option<bool>,
+    pub line_through: Option<bool>,
 
     /// `font-style: italic|oblique`. Inherited. Selects an available oblique
     /// face when shaping; the bundled Linux `system-ui` face synthesizes its

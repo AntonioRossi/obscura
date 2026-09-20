@@ -2566,7 +2566,7 @@ fn cascade_node_style(
     tree: &DomTree,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
-    document_sheet: &crate::css::Stylesheet,
+    _document_sheet: &crate::css::Stylesheet,
     shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
@@ -4076,6 +4076,59 @@ fn retained_style_plan(
     }
 }
 
+/// A selector-only `tabindex` mutation cannot change layout or paint when the
+/// current stylesheet has no dependency on it. Keep this deliberately narrow:
+/// other zero-dirty attributes can still affect native geometry.
+pub(crate) fn can_retain_layout_for_tabindex(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    cache: &mut crate::css::StylesheetCache,
+    mutations: &[RetainedStyleMutation],
+) -> bool {
+    if mutations.is_empty()
+        || !mutations.iter().all(|mutation| {
+            matches!(mutation, RetainedStyleMutation::Attribute(attribute)
+                if attribute.name.eq_ignore_ascii_case("tabindex")
+                    && retained_attribute_mutation_kind(tree, attribute.node, &attribute.name)
+                        == RetainedAttributeMutationKind::Selector)
+        })
+    {
+        return false;
+    }
+
+    let nodes = tree.descendants(tree.document());
+    if nodes.iter().any(|node| tree.shadow_root(*node).is_some()) {
+        return false;
+    }
+    let sources = nodes
+        .into_iter()
+        .filter_map(|id| {
+            let node = tree.get_node(id)?;
+            let element = node.as_element()?;
+            (element.local.as_ref() == "style"
+                && node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media,
+                            viewport,
+                            crate::CssMediaType::Screen,
+                        )
+                }))
+            .then(|| tree.text_content(id))
+        })
+        .collect::<Vec<_>>();
+    let (sheet, cache_hit) =
+        cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
+    cache_hit
+        && matches!(
+            retained_style_plan(tree, &sheet, mutations),
+            RetainedStylePlan::Reuse {
+                dirty,
+                has_animation_damage: false,
+            } if dirty.is_empty()
+        )
+}
+
 pub(crate) fn layout_dom_with_web_fonts(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -4295,6 +4348,7 @@ fn collect_shadow_stylesheets(
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
 ) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
+    let external = tree.external_stylesheets();
     let mut roots = Vec::new();
     let mut stack = vec![tree.document()];
     let mut visited = HashSet::new();
@@ -4312,24 +4366,35 @@ fn collect_shadow_stylesheets(
     roots
         .into_iter()
         .map(|root| {
-            let sources = tree
-                .descendants(root)
-                .into_iter()
-                .filter_map(|node_id| {
-                    let node = tree.get_node(node_id)?;
-                    let element = node.as_element()?;
-                    (element.local.as_ref() == "style"
-                        && node.get_attribute("media").is_none_or(|media| {
-                            media.trim().is_empty()
-                                || crate::css::media_query_applies_for_viewport_and_type(
-                                    media,
-                                    viewport,
-                                    media_type,
-                                )
-                        }))
-                    .then(|| tree.text_content(node_id))
-                })
-                .collect::<Vec<_>>();
+            let mut sources = Vec::new();
+            for node_id in tree.descendants(root) {
+                let Some(node) = tree.get_node(node_id) else {
+                    continue;
+                };
+                let Some(element) = node.as_element() else {
+                    continue;
+                };
+                let media_applies = node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media, viewport, media_type,
+                        )
+                });
+                let linked = element.local.as_ref() == "link"
+                    && node.get_attribute("disabled").is_none()
+                    && node.get_attribute("rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                    });
+                if media_applies && (linked || element.local.as_ref() == "style") {
+                    if let Some(sheet) = external.get(&node_id) {
+                        sources.extend(sheet.sources.iter().map(ToString::to_string));
+                    }
+                }
+                if media_applies && element.local.as_ref() == "style" {
+                    sources.push(tree.text_content(node_id));
+                }
+            }
             let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
                 tree,
                 &sources,
@@ -4356,21 +4421,31 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
-    // Collect the text of every <style> block in document order.
+    // Collect inline and host-fetched author sheets in document order. Loaded
+    // cross-origin bytes remain outside the page-visible DOM.
+    let external = tree.external_stylesheets();
     let mut css_sources = Vec::new();
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
             if let Some(elem) = node.as_element() {
-                if elem.local.as_ref() == "style"
-                    && node.get_attribute("media").is_none_or(|media| {
-                        media.trim().is_empty()
-                            || crate::css::media_query_applies_for_viewport_and_type(
-                                media,
-                                viewport,
-                                media_type,
-                            )
-                    })
-                {
+                let media_applies = node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media, viewport, media_type,
+                        )
+                });
+                let linked = elem.local.as_ref() == "link"
+                    && node.get_attribute("disabled").is_none()
+                    && node.get_attribute("rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                    });
+                if media_applies && (linked || elem.local.as_ref() == "style") {
+                    if let Some(sheet) = external.get(&nid) {
+                        css_sources.extend(sheet.sources.iter().map(ToString::to_string));
+                    }
+                }
+                if media_applies && elem.local.as_ref() == "style" {
                     css_sources.push(tree.text_content(nid));
                 }
             }
@@ -14785,6 +14860,28 @@ mod tests {
     }
 
     #[test]
+    fn host_fetched_stylesheet_cascades_without_a_visible_style_node() {
+        let tree = parse_html(
+            r#"<html><head><link rel="stylesheet" href="https://cdn.test/app.css"></head><body><div id="target"></div></body></html>"#,
+        );
+        let link = tree
+            .query_selector("link")
+            .expect("valid selector")
+            .expect("stylesheet link");
+        assert!(tree.replace_external_stylesheet(
+            link,
+            "#target{width:37px;height:19px}".to_string(),
+            false,
+        ));
+
+        let laid = layout_dom(&tree, (200.0, 100.0));
+        let target = tree.get_element_by_id("target").expect("target");
+        assert_eq!(laid.rects[&target].width, 37.0);
+        assert_eq!(laid.rects[&target].height, 19.0);
+        assert!(tree.query_selector_all("style").unwrap().is_empty());
+    }
+
+    #[test]
     fn shadow_rendered_children_distribute_named_and_default_slots() {
         let tree = parse_html(
             r#"<x-card id="host"><span id="default"></span><span id="title" slot="title"></span><span id="unslotted" slot="missing"></span></x-card><div id="source"><div id="before"></div><slot id="title-slot" name="title"><b id="title-fallback"></b></slot><slot id="duplicate-title" name="title"><i id="duplicate-fallback"></i></slot><slot id="default-slot"><em id="default-fallback"></em></slot><div id="after"></div></div>"#,
@@ -16864,6 +16961,72 @@ mod tests {
         assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
         assert_eq!(telemetry.retained_fresh, 0, "{telemetry:?}");
         assert!(telemetry.retained_reused >= 1_000, "{telemetry:?}");
+    }
+
+    #[test]
+    fn unreferenced_tabindex_can_retain_layout_but_css_dependencies_cannot() {
+        for (css, reusable) in [
+            ("#target { width: 80px }", true),
+            ("[tabindex] { width: 160px }", false),
+            ("p::before { content: attr(tabindex) }", false),
+            ("section:has([tabindex]) p { height: 50px }", false),
+        ] {
+            let tree = parse_html(&format!(
+                "<style>{css}</style><section><p id=target>text</p></section>"
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                viewport,
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            let mutation = |name: &str| {
+                RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                    node: target,
+                    name: name.into(),
+                    old_value: None,
+                    new_value: Some("0".into()),
+                })
+            };
+
+            assert_eq!(
+                can_retain_layout_for_tabindex(
+                    &tree,
+                    viewport,
+                    &mut cache,
+                    &[mutation("tabindex")],
+                ),
+                reusable,
+                "{css}"
+            );
+            for name in ["data-sized", "style", "hidden", "open"] {
+                assert!(
+                    !can_retain_layout_for_tabindex(
+                        &tree,
+                        viewport,
+                        &mut cache,
+                        &[mutation(name)],
+                    ),
+                    "{name}"
+                );
+            }
+            assert!(!can_retain_layout_for_tabindex(
+                &tree,
+                viewport,
+                &mut cache,
+                &[RetainedStyleMutation::Resource],
+            ));
+            assert!(!can_retain_layout_for_tabindex(
+                &tree,
+                (600.0, 300.0),
+                &mut cache,
+                &[mutation("tabindex")],
+            ));
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -16,7 +16,8 @@ use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    same_site, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    SameSiteContext,
 };
 use tokio::sync::Mutex;
 
@@ -305,6 +306,9 @@ pub struct ObscuraState {
     /// The document's input stream for `document.write()`, created on the first call.
     /// Why the calls share one parser is in `write_stream`.
     pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
+    /// Cheap native signal that the current parser script wrote another
+    /// script. This avoids polling V8 after every ordinary parser script.
+    pub(crate) document_write_inserted_script: Cell<bool>,
 }
 
 /// A frame document waiting to be given a realm.
@@ -441,6 +445,7 @@ impl ObscuraState {
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
             write_stream: RefCell::new(None),
+            document_write_inserted_script: Cell::new(false),
         }
     }
 }
@@ -736,7 +741,7 @@ pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
 ///
 /// A page with no frames pays only an `is_empty` check: looking up the current
 /// context is not free, and `op_dom` is the hottest op in the system.
-pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+pub fn realm_state(scope: &mut v8::PinScope, op_state: &OpState) -> SharedState {
     let page = || op_state.borrow::<SharedState>().clone();
     let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
         Some(registry) => registry.clone(),
@@ -1383,6 +1388,108 @@ fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
         .unwrap_or_default()
 }
 
+fn stylesheet_origin_clean(document_url: &str, response_url: &str) -> bool {
+    let (Ok(document), Ok(response)) =
+        (url::Url::parse(document_url), url::Url::parse(response_url))
+    else {
+        return false;
+    };
+    document.origin() == response.origin()
+}
+
+/// Install host-fetched CSS without manufacturing a page-visible `<style>`.
+#[op2(fast)]
+fn op_external_stylesheet_set(
+    state: &OpState,
+    owner_nid: u32,
+    #[string] css: String,
+    #[string] response_url: String,
+    imported_origin_clean: bool,
+    frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let owner = NodeId::new(owner_nid);
+    let valid_owner = state.dom.as_ref().is_some_and(|dom| {
+        dom.get_node(owner).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| matches!(element.local.as_ref(), "link" | "style"))
+        })
+    });
+    if !valid_owner {
+        return false;
+    }
+    let origin_clean = imported_origin_clean && stylesheet_origin_clean(&state.url, &response_url);
+    let connected = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| node_is_connected(dom, owner));
+    let changed = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| dom.replace_external_stylesheet(owner, css, origin_clean));
+    if changed && connected {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+    }
+    changed
+}
+
+#[op2(fast)]
+fn op_external_stylesheet_remove(state: &OpState, owner_nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let owner = NodeId::new(owner_nid);
+    let connected = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| node_is_connected(dom, owner));
+    let changed = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| dom.remove_external_stylesheet(owner));
+    if changed && connected {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+    }
+    changed
+}
+
+/// Return CSSOM-readable bytes only for an origin-clean loaded sheet.
+#[op2]
+#[string]
+fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
+    let state = shared.borrow();
+    let Some(sheet) = state
+        .dom
+        .as_ref()
+        .and_then(|dom| dom.external_stylesheet(NodeId::new(owner_nid)))
+    else {
+        return "null".to_string();
+    };
+    if !sheet.origin_clean {
+        return r#"{"originClean":false}"#.to_string();
+    }
+    let css = sheet
+        .sources
+        .iter()
+        .map(|source| source.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::json!({ "originClean": true, "css": css }).to_string()
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -1962,11 +2069,24 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
+            let node_id = NodeId::new(nid);
+            // Removing `id` must clear the id_index too, matching set_attribute /
+            // remove_attribute_ns; otherwise getElementById keeps returning the
+            // still-attached element (#1013).
+            let old_id = if arg2 == "id" {
+                dom.with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
+                    .flatten()
+            } else {
+                None
+            };
+            dom.with_node_mut(node_id, |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
                     attrs.retain(|a| !a.qualified_name_eq(&arg2));
                 }
             });
+            if arg2 == "id" {
+                dom.update_id_index(node_id, old_id.as_deref(), None);
+            }
             "true".into()
         }
         // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
@@ -2104,8 +2224,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_write" => {
             let mut slot = gs.write_stream.borrow_mut();
             let stream = slot.get_or_insert_with(DocumentWriteStream::new);
-            let pairs: Vec<[i32; 2]> = stream
-                .write(&arg2, dom)
+            let placements = stream.write(&arg2, dom);
+            if placements
+                .iter()
+                .any(|placement| node_is_script(dom, placement.node))
+            {
+                gs.document_write_inserted_script.set(true);
+            }
+            let pairs: Vec<[i32; 2]> = placements
                 .iter()
                 .map(|placement| {
                     [
@@ -2119,6 +2245,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
             *gs.write_stream.borrow_mut() = None;
+            gs.document_write_inserted_script.set(false);
             "true".into()
         }
         "set_text_content" => {
@@ -2537,6 +2664,39 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Strip headers that must not survive a redirect. On a redirect that changes
+/// origin, credential headers (`Authorization`, `Proxy-Authorization`, an
+/// explicit `Cookie`) are removed so they are not forwarded to a different
+/// origin — matching browsers and the Fetch spec (a cross-origin redirect must
+/// not leak the caller's credentials). When a 301/302/303 downgrades the method
+/// to GET, the request-body headers are removed since the body is dropped.
+fn sanitize_redirect_headers(
+    headers: &mut HashMap<String, String>,
+    crosses_origin: bool,
+    downgraded_to_get: bool,
+) {
+    if crosses_origin {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            )
+        });
+    }
+    if downgraded_to_get {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-encoding"
+                    | "content-language"
+                    | "content-location"
+            )
+        });
+    }
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2706,6 +2866,56 @@ fn preflight_allows_header(name: &str, allowed: &[&str], credentialed: bool) -> 
             && allowed.contains(&"*"))
 }
 
+fn visible_response_headers(
+    headers: &HashMap<String, String>,
+    cross_origin: bool,
+    credentials: FetchCredentials,
+) -> HashMap<String, String> {
+    const SAFE: [&str; 7] = [
+        "cache-control",
+        "content-language",
+        "content-length",
+        "content-type",
+        "expires",
+        "last-modified",
+        "pragma",
+    ];
+
+    let mut expose_all = false;
+    let mut exposed = Vec::new();
+    if cross_origin {
+        if let Some(value) = headers.get("access-control-expose-headers") {
+            for name in value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                if name == "*" && credentials != FetchCredentials::Include {
+                    expose_all = true;
+                } else {
+                    exposed.push(name);
+                }
+            }
+        }
+    }
+
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            if name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2") {
+                return false;
+            }
+            !cross_origin
+                || expose_all
+                || SAFE.iter().any(|safe| name.eq_ignore_ascii_case(safe))
+                || exposed
+                    .iter()
+                    .any(|exposed| name.eq_ignore_ascii_case(exposed))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// Build the JS-facing result for an intercepted request a CDP client chose to
 /// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
 /// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
@@ -2718,17 +2928,29 @@ fn intercept_fulfill_response(
     body: &str,
     body_base64: &str,
     url: &str,
+    page_origin: &str,
+    mode: &str,
+    credentials: FetchCredentials,
+    internal_load: bool,
 ) -> serde_json::Value {
+    let cross_origin = request_origin(url).is_some_and(|origin| origin != page_origin);
+    let opaque = !internal_load && mode == "no-cors" && cross_origin;
+    let visible_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&headers, cross_origin, credentials)
+    };
     serde_json::json!({
-        "status": status,
-        "body": body,
-        "bodyBase64": body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { "" } else { body },
+        "bodyBase64": if opaque { "" } else { body_base64 },
         "url": url,
-        "headers": headers,
+        "headers": visible_headers,
+        "opaque": opaque,
     })
 }
 
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
@@ -2739,6 +2961,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    internal_load: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
     tracing::debug!(
@@ -2827,6 +3050,7 @@ async fn op_fetch_url(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -2855,7 +3079,18 @@ async fn op_fetch_url(
                     body: b,
                     body_base64: bb,
                 }) => {
-                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
+                    return Ok(intercept_fulfill_response(
+                        status,
+                        h,
+                        &b,
+                        &bb,
+                        &url,
+                        &origin,
+                        &mode,
+                        credentials,
+                        internal_load,
+                    )
+                    .to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -2930,7 +3165,6 @@ async fn op_fetch_url(
         origin.clone()
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
-    let credentials = FetchCredentials::parse(&credentials);
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -2983,6 +3217,15 @@ async fn op_fetch_url(
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
 
+        // Fetch spec: the preflight response's status must be an ok status
+        // before its CORS headers are consulted (#973).
+        if !preflight.status().is_success() {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight returned HTTP {}",
+                preflight.status()
+            )));
+        }
+
         let allowed_origin = preflight
             .headers()
             .get("access-control-allow-origin")
@@ -2998,12 +3241,6 @@ async fn op_fetch_url(
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
-            )));
-        }
-        if !preflight.status().is_success() {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "CORS preflight returned HTTP {}",
-                preflight.status()
             )));
         }
 
@@ -3066,6 +3303,7 @@ async fn op_fetch_url(
                 credentials,
                 callbacks.clone(),
                 allow_private_network,
+                internal_load,
             )
             .await;
         }
@@ -3078,9 +3316,13 @@ async fn op_fetch_url(
     let mut current_url = url.clone();
     let mut current_method = req_method;
     let mut current_body = body;
+    // A mutable copy applied per hop: credential headers are dropped when a
+    // redirect crosses origin, and body headers when the method downgrades.
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
+    let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -3098,7 +3340,15 @@ async fn op_fetch_url(
         if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
                 if let Ok(parsed_url) = url::Url::parse(&current_url) {
-                    let cookie_header = jar.get_cookie_header(&parsed_url);
+                    let context = if cookie_initiator
+                        .as_ref()
+                        .is_some_and(|source| same_site(source, &parsed_url))
+                    {
+                        SameSiteContext::SameSite
+                    } else {
+                        SameSiteContext::CrossSite
+                    };
+                    let cookie_header = jar.get_cookie_header_in_context(&parsed_url, context);
                     if !cookie_header.is_empty() {
                         req = req.header("Cookie", &cookie_header);
                     }
@@ -3109,7 +3359,7 @@ async fn op_fetch_url(
         // Send a default User-Agent on fetch()/XHR requests (the navigation path
         // sets one, but this op did not, so scripted requests went out with no UA
         // and UA-gated servers rejected them). Honor an explicit override.
-        if !custom_headers
+        if !current_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
         {
@@ -3119,7 +3369,7 @@ async fn op_fetch_url(
             );
         }
 
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -3156,6 +3406,33 @@ async fn op_fetch_url(
 
         if !resp.status().is_redirection() {
             break resp;
+        }
+
+        // Fetch spec: the CORS check applies to every response in cors mode,
+        // not only the final one. A cross-origin redirect response must be
+        // authorized before it is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = resp
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let allow_credentials = resp
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
 
         let location_header = resp
@@ -3206,10 +3483,17 @@ async fn op_fetch_url(
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         // 307/308 preserve method and body.
         let status_code = resp.status().as_u16();
-        if status_code == 301 || status_code == 302 || status_code == 303 {
+        let downgraded_to_get =
+            status_code == 301 || status_code == 302 || status_code == 303;
+        if downgraded_to_get {
             current_method = reqwest::Method::GET;
             current_body.clear();
         }
+
+        // Do not forward the caller's credentials to a different origin, and
+        // drop the body headers once the body is gone (#967).
+        let crosses_origin = base.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
 
         redirected_from.push(base);
         current_url = next_url.to_string();
@@ -3333,15 +3617,22 @@ async fn op_fetch_url(
         resp_body.len()
     );
 
+    let opaque = !internal_load && mode == "no-cors" && crossed_origin;
+    let script_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
+    };
+
     Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { String::new() } else { resp_body },
+        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "requestId": response_request_id,
         "url": current_url,
         "redirected": redirected,
-        "opaque": mode == "no-cors" && crossed_origin,
-        "headers": resp_headers,
+        "opaque": opaque,
+        "headers": script_headers,
     })
     .to_string())
 }
@@ -3383,15 +3674,20 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    internal_load: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
+    // Applied per hop; credential headers are dropped on a cross-origin
+    // redirect and body headers on a GET downgrade (#967).
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
+    let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -3410,18 +3706,28 @@ async fn stealth_fetch_all(
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
+        let cookie_context = credentials_allowed.then(|| {
+            if cookie_initiator
+                .as_ref()
+                .is_some_and(|source| same_site(source, &parsed_current))
+            {
+                SameSiteContext::SameSite
+            } else {
+                SameSiteContext::CrossSite
+            }
+        });
         let r = stealth
-            .send_single(
+            .send_single_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
-                credentials_allowed,
+                cookie_context,
                 credentials_allowed,
             )
             .await
@@ -3429,6 +3735,31 @@ async fn stealth_fetch_all(
 
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body);
+        }
+        // Cross-origin redirect responses must pass the CORS check too, before
+        // the redirect is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = r
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str)
+                .unwrap_or("");
+            let allow_credentials = r
+                .headers
+                .get("access-control-allow-credentials")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
         let Some(location) = r.headers.get("location").cloned() else {
             break (r.status, r.headers, r.body);
@@ -3457,10 +3788,14 @@ async fn stealth_fetch_all(
             .to_string());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
-        if r.status == 301 || r.status == 302 || r.status == 303 {
+        let downgraded_to_get = r.status == 301 || r.status == 302 || r.status == 303;
+        if downgraded_to_get {
             current_method = "GET".to_string();
             current_body.clear();
         }
+        // Do not forward credentials to a different origin (#967).
+        let crosses_origin = parsed_current.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
@@ -3518,14 +3853,21 @@ async fn stealth_fetch_all(
         }
     }
 
+    let opaque = !internal_load && mode == "no-cors" && crossed_origin;
+    let script_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
+    };
+
     Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { String::new() } else { resp_body },
+        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "url": current_url,
         "redirected": redirects_followed > 0,
-        "opaque": mode == "no-cors" && crossed_origin,
-        "headers": resp_headers,
+        "opaque": opaque,
+        "headers": script_headers,
     })
     .to_string())
 }
@@ -3563,10 +3905,44 @@ mod tests {
         cors_response_allows, cors_unsafe_request_header_names, glob_match,
         is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
-        validate_fetch_url, FetchCredentials, ObscuraState,
+        sanitize_redirect_headers, validate_fetch_url, FetchCredentials, ObscuraState,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    // #967 — a redirect must not forward the caller's credentials to a
+    // different origin, and a 301/302/303 GET downgrade drops the body headers.
+    #[test]
+    fn redirect_strips_credentials_cross_origin_and_body_headers_on_get() {
+        let base = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("Authorization".to_string(), "Bearer secret".to_string());
+            h.insert("Cookie".to_string(), "sid=1".to_string());
+            h.insert("Content-Type".to_string(), "application/json".to_string());
+            h.insert("X-Keep".to_string(), "yes".to_string());
+            h
+        };
+
+        // Cross-origin redirect, method preserved: drop credential headers,
+        // keep the body header and any custom header.
+        let mut cross = base();
+        sanitize_redirect_headers(&mut cross, true, false);
+        assert!(!cross.contains_key("Authorization"), "Authorization must be stripped cross-origin");
+        assert!(!cross.contains_key("Cookie"), "explicit Cookie must be stripped cross-origin");
+        assert!(cross.contains_key("Content-Type"));
+        assert!(cross.contains_key("X-Keep"));
+
+        // Same-origin 301/302/303 GET downgrade: keep credentials, drop body headers.
+        let mut downgrade = base();
+        sanitize_redirect_headers(&mut downgrade, false, true);
+        assert!(downgrade.contains_key("Authorization"), "Authorization kept on same-origin redirect");
+        assert!(!downgrade.contains_key("Content-Type"), "Content-Type dropped on GET downgrade");
+
+        // Same-origin, method preserved: nothing stripped.
+        let mut same = base();
+        sanitize_redirect_headers(&mut same, false, false);
+        assert_eq!(same.len(), 4, "nothing stripped when same-origin and method preserved");
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -3581,9 +3957,29 @@ mod tests {
     use obscura_dom::ShadowRootMode;
 
     use super::read_body_capped;
+    use super::{intercept_fulfill_response, visible_response_headers};
+    use super::url_set_inner;
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
-    use super::intercept_fulfill_response;
     use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+
+    // #1008: URL property setters must follow WHATWG — search/hash keep a bare
+    // delimiter as an empty component, and port parses the leading digits.
+    #[test]
+    fn url_setters_follow_whatwg_search_hash_and_port() {
+        // search = "?" keeps an empty query -> serializes with a trailing "?".
+        let r = url_set_inner("http://example.com/path", "search", "?").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path?"));
+        // search = "" removes the query.
+        let r = url_set_inner("http://example.com/path?a=1", "search", "").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path"));
+        // hash = "#" keeps an empty fragment.
+        let r = url_set_inner("http://example.com/path", "hash", "#").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path#"));
+        // port = "8080abc" parses the leading digits -> 8080.
+        let r = url_set_inner("http://example.com/", "port", "8080abc").unwrap();
+        assert_eq!(r["port"], serde_json::json!("8080"));
+        assert_eq!(r["href"], serde_json::json!("http://example.com:8080/"));
+    }
 
     #[test]
     fn cors_request_header_safelist_checks_values() {
@@ -3731,6 +4127,10 @@ mod tests {
             &lossy,
             &b64,
             "https://example.test/",
+            "https://example.test",
+            "cors",
+            FetchCredentials::SameOrigin,
+            false,
         );
         let out_b64 = result["bodyBase64"]
             .as_str()
@@ -3739,6 +4139,72 @@ mod tests {
             .decode(out_b64)
             .expect("bodyBase64 must be valid base64");
         assert_eq!(decoded, raw, "the exact bytes must survive via bodyBase64");
+    }
+
+    #[test]
+    fn intercepted_internal_load_keeps_cross_origin_body_private_but_usable() {
+        let public = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            "script body",
+            "",
+            "https://cdn.example/script.js",
+            "https://page.example",
+            "no-cors",
+            FetchCredentials::SameOrigin,
+            false,
+        );
+        assert_eq!(public["status"], 0);
+        assert_eq!(public["body"], "");
+        assert_eq!(public["opaque"], true);
+
+        let internal = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            "script body",
+            "",
+            "https://cdn.example/script.js",
+            "https://page.example",
+            "no-cors",
+            FetchCredentials::SameOrigin,
+            true,
+        );
+        assert_eq!(internal["status"], 200);
+        assert_eq!(internal["body"], "script body");
+        assert_eq!(internal["opaque"], false);
+    }
+
+    #[test]
+    fn response_headers_hide_cookies_and_unexposed_cross_origin_fields() {
+        let headers = std::collections::HashMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("set-cookie".to_string(), "sid=secret; HttpOnly".to_string()),
+            ("x-secret".to_string(), "hidden".to_string()),
+            ("x-visible".to_string(), "shown".to_string()),
+            (
+                "access-control-expose-headers".to_string(),
+                "X-Visible, Set-Cookie".to_string(),
+            ),
+        ]);
+
+        let same_origin = visible_response_headers(&headers, false, FetchCredentials::SameOrigin);
+        assert!(!same_origin.contains_key("set-cookie"));
+        assert_eq!(
+            same_origin.get("x-secret").map(String::as_str),
+            Some("hidden")
+        );
+
+        let cross_origin = visible_response_headers(&headers, true, FetchCredentials::SameOrigin);
+        assert_eq!(
+            cross_origin.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            cross_origin.get("x-visible").map(String::as_str),
+            Some("shown")
+        );
+        assert!(!cross_origin.contains_key("x-secret"));
+        assert!(!cross_origin.contains_key("set-cookie"));
     }
 
     // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
@@ -4150,7 +4616,7 @@ mod tests {
                 "posted-task-from-op-resolution",
                 r#"
                     globalThis.__postedFromOp = 0;
-                    Deno.core.ops.op_sleep(0).then(() => {
+                    __obscura_test_ops.op_sleep(0).then(() => {
                         const rearm = () => scheduler.postTask(() => {
                             __postedFromOp++;
                             if (__postedFromOp < 250) rearm();
@@ -4553,7 +5019,7 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -4568,7 +5034,7 @@ fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str: &str) {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -4586,7 +5052,7 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
@@ -4668,7 +5134,7 @@ fn op_post_frame_message(
 /// and a snapshot-restored realm has none. This resolves an ordinary promise
 /// instead, and V8 reports the frame as the microtask context, so the ops a
 /// timer callback makes still find the frame's own document.
-#[op2(async)]
+#[op2]
 async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
@@ -4681,7 +5147,7 @@ const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 // id means the bounded native queue refused the document.
 #[op2(fast)]
 fn op_frame_document_ready(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
@@ -4741,7 +5207,7 @@ fn op_async_runtime_available() -> bool {
 fn op_posted_task(
     state: &OpState,
     frame_id: u32,
-    #[global] callback: v8::Global<v8::Function>,
+    #[scoped] callback: v8::Global<v8::Function>,
 ) -> f64 {
     let Some(owner) = posted_task_owner(state, frame_id) else {
         return INVALID_POSTED_TASK_GENERATION;
@@ -4760,7 +5226,7 @@ fn op_posted_task(
             }
             PostedTaskOwnerStatus::Generation(generation) => generation as f64,
         };
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let scope, scope);
         let callback = v8::Local::new(scope, callback);
         let receiver = v8::undefined(scope).into();
         let current_generation = v8::Number::new(scope, current_generation);
@@ -5247,18 +5713,31 @@ fn url_set_inner(href: &str, part: &str, value: &str) -> Option<serde_json::Valu
         "port" => {
             if value.is_empty() {
                 let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                let _ = u.set_port(Some(p));
+            } else {
+                // WHATWG port-state parser consumes the leading digits and stops
+                // at the first non-digit, so "8080abc" sets port 8080.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(p) = digits.parse::<u16>() {
+                    let _ = u.set_port(Some(p));
+                }
             }
         }
         "pathname" => u.set_path(value),
         "search" => {
-            let q = value.strip_prefix('?').unwrap_or(value);
-            u.set_query(if q.is_empty() { None } else { Some(q) });
+            // WHATWG: a null query only for the empty string; a bare "?" is an
+            // empty (not null) query that serializes with a trailing "?".
+            if value.is_empty() {
+                u.set_query(None);
+            } else {
+                u.set_query(Some(value.strip_prefix('?').unwrap_or(value)));
+            }
         }
         "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
+            if value.is_empty() {
+                u.set_fragment(None);
+            } else {
+                u.set_fragment(Some(value.strip_prefix('#').unwrap_or(value)));
+            }
         }
         _ => {}
     }
@@ -5584,6 +6063,9 @@ pub fn build_extension() -> Extension {
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),
+        op_external_stylesheet_set(),
+        op_external_stylesheet_remove(),
+        op_external_stylesheet_get(),
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
@@ -6281,7 +6763,7 @@ fn finish_async_image_metadata(
 /// navigation/URL/profile share one fetch, and completion revalidates both the
 /// document identity and responsive candidate before exposing lifecycle state.
 #[cfg(feature = "render")]
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
     let shared = {
@@ -6631,8 +7113,17 @@ fn subdocument_layout(state: &OpState, request: &str, frame_id: u32) -> String {
         let Some(cloned_root) = tree.import_node_from(tree.document(), source, root) else {
             return String::new();
         };
-        let nodes = std::iter::once(root).chain(source.descendants(root))
+        let nodes: HashMap<_, _> = std::iter::once(root).chain(source.descendants(root))
             .zip(std::iter::once(cloned_root).chain(tree.descendants(cloned_root))).collect();
+        // Host-fetched linked CSS is not serialized into the DOM. Transfer
+        // its private registry when cloning a frame for isolated layout.
+        for (&owner, &cloned_owner) in &nodes {
+            if let Some(sheet) = source.external_stylesheet(owner) {
+                for css in sheet.sources {
+                    tree.append_external_stylesheet(cloned_owner, css.to_string(), sheet.origin_clean);
+                }
+            }
+        }
         // Geometry must not open HTTP through the renderer's compatibility
         // client. Page resource preparation populates this shared cache using
         // the native cookie/proxy/CORS-aware transport, then invalidates layout.

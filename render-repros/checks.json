@@ -1,4 +1,7 @@
 {
+  "linked-font-resource": [
+    {"name": "linked stylesheet font replaces the proportional fallback", "color": "#22aa66", "x": 24, "y": 200, "width": 240, "height": 24}
+  ],
   "iframe-document-geometry": [
     {"name": "child element and range probes completed", "color": "#22aa66", "width": 240, "height": 24, "count": 2}
   ],

@@ -1730,8 +1730,6 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             });
         }
         "text-decoration" | "text-decoration-line" => {
-            // Shorthand can carry color/style/thickness; we only model the
-            // underline line (the dominant case, and the UA default for links).
             let toks: Vec<String> = value
                 .split_whitespace()
                 .map(|t| t.to_ascii_lowercase())
@@ -1739,6 +1737,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             let underline = toks.iter().any(|t| t == "underline");
             let none = toks.iter().any(|t| t == "none");
             style.underline = Some(underline && !none);
+            style.overline = Some(!none && toks.iter().any(|token| token == "overline"));
+            style.line_through = Some(!none && toks.iter().any(|token| token == "line-through"));
         }
         "gap" | "grid-gap" => {
             let values = split_ws_paren(value);
@@ -3036,7 +3036,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         ),
         "text-decoration" | "text-decoration-line" => lower
             .split_whitespace()
-            .all(|token| matches!(token, "none" | "underline")),
+            .all(|token| matches!(token, "none" | "underline" | "overline" | "line-through")),
         "line-height" => lower == "normal" || finite_number(value) || dimension(value, false),
         "gap" | "grid-gap" => dimensions(value, false, 2),
         "row-gap" | "grid-row-gap" | "column-gap" | "grid-column-gap" | "-webkit-column-gap" => {
@@ -6383,7 +6383,32 @@ struct LengthContext {
     percent_base: f32,
 }
 
+// CSS math functions recurse through nested calc()/min()/max()/clamp()
+// expressions. Real stylesheets stay shallow; bounding the nesting prevents a
+// hostile declaration from exhausting the native stack before it is rejected.
+const MAX_CSS_MATH_NESTING: usize = 64;
+
+fn css_math_nesting_is_safe(value: &str) -> bool {
+    let mut depth = 0usize;
+    for character in value.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                if depth > MAX_CSS_MATH_NESTING {
+                    return false;
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
 fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let value = value.trim();
     if let Some(rest) = value.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -6607,6 +6632,9 @@ fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
 /// example from Wikipedia's icon sizing), so each case recurses back into
 /// this function rather than assuming a flat expression.
 fn resolve_length(value: &str) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let v = value.trim();
     if let Some(rest) = v.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -10821,6 +10849,26 @@ mod tests {
         // calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))
         let expr = "calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))";
         assert_eq!(resolve_length(expr), Some(20.0));
+    }
+
+    #[test]
+    fn deeply_nested_css_math_is_rejected_without_recursing() {
+        let mut expression = "1px".to_string();
+        for _ in 0..5_000 {
+            expression = format!("calc({expression})");
+        }
+
+        assert_eq!(resolve_length(&expression), None);
+        assert_eq!(
+            resolve_contextual_length(&expression, 16.0, 16.0, 10.0, 10.0, 100.0),
+            None
+        );
+
+        let mut ordinary = "1px".to_string();
+        for _ in 0..8 {
+            ordinary = format!("calc({ordinary})");
+        }
+        assert_eq!(resolve_length(&ordinary), Some(1.0));
     }
 
     #[test]
