@@ -1,6 +1,20 @@
 use obscura_js::runtime::ObscuraJsRuntime;
 use serde_json::json;
 
+#[cfg(feature = "render")]
+#[test]
+fn reduced_motion_refreshes_existing_computed_style_objects() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<style>div{width:100px}@media(prefers-reduced-motion:reduce){div{width:40px}}</style><div>probe</div>"));
+    rt.run_page_init();
+    rt.evaluate("globalThis.liveStyle = getComputedStyle(document.querySelector('div'))").unwrap();
+    assert_eq!(rt.evaluate("liveStyle.width").unwrap(), json!("100px"));
+    rt.set_reduced_motion(true);
+    assert_eq!(rt.evaluate("liveStyle.width").unwrap(), json!("40px"));
+    rt.set_reduced_motion(false);
+    assert_eq!(rt.evaluate("liveStyle.width").unwrap(), json!("100px"));
+}
+
 #[tokio::test]
 async fn reduced_motion_updates_queries_and_change_events() {
     let mut rt = ObscuraJsRuntime::new();
